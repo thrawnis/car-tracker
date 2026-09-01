@@ -6,16 +6,18 @@ import pino from "pino";
 
 const logger = pino({ name: "reminder-engine" });
 
-interface DueCheck {
+export interface DueCheck {
   isDue: boolean;
   dueDate: Date | null;
   dueOdometer: number | null;
   reason: string;
 }
 
-async function evaluateRule(rule: ReminderRule, currentOdometer: number | null): Promise<DueCheck> {
-  const now = new Date();
-
+/**
+ * Pure trigger-type logic, exported for direct unit testing. Takes `now` explicitly
+ * so tests don't depend on the wall clock or need to fabricate elapsed time via the DB.
+ */
+export function evaluateRule(rule: ReminderRule, currentOdometer: number | null, now: Date = new Date()): DueCheck {
   if (rule.triggerType === "ONE_TIME_DATE") {
     const dueDate = rule.oneTimeDate;
     if (!dueDate) return { isDue: false, dueDate: null, dueOdometer: null, reason: "" };
@@ -82,7 +84,7 @@ export async function runReminderSweep(): Promise<void> {
   for (const rule of rules) {
     try {
       const currentOdometer = await getLatestOdometer(rule.vehicleId);
-      const check = await evaluateRule(rule, currentOdometer);
+      const check = evaluateRule(rule, currentOdometer);
 
       let reminder = await prisma.reminder.findFirst({
         where: { reminderRuleId: rule.id, status: { in: ["PENDING", "DUE"] } },

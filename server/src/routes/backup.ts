@@ -146,7 +146,10 @@ backupRouter.post("/export", async (req, res) => {
 
   const file = encryptExportPayload(payload, parsed.data.passphrase);
 
-  res.setHeader("Content-Type", "application/octet-stream");
+  // The file is just the JSON envelope from encryptExportPayload; serving it as JSON
+  // (rather than application/octet-stream) keeps it readable by ordinary HTTP tooling
+  // while Content-Disposition still makes the browser download it as a .ctbackup file.
+  res.setHeader("Content-Type", "application/json");
   res.setHeader("Content-Disposition", `attachment; filename="car-tracker-backup-${Date.now()}.ctbackup"`);
   res.send(file);
 });

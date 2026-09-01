@@ -37,7 +37,12 @@ const schema = z.object({
   notes: z.string().max(2000).nullable().optional(),
 });
 
-/** Computes fuel economy between consecutive *full* fill-ups (partial fills break the interval). */
+/**
+ * Computes fuel economy between consecutive *full* fill-ups. A `missedFillUp` entry means
+ * the driver knows a previous fill-up went unlogged, so any window ending there can't be
+ * trusted: it publishes no economy figure and, if it was itself a full fill-up, becomes the
+ * fresh starting anchor for the next window (since we do know the tank was topped off then).
+ */
 function computeEconomy(logs: FuelLog[], fuelUnit: "GALLONS" | "LITERS") {
   const sorted = [...logs].sort((a, b) => a.odometer - b.odometer);
   const results: { fuelLogId: string; distance: number; economy: number | null }[] = [];
@@ -45,7 +50,14 @@ function computeEconomy(logs: FuelLog[], fuelUnit: "GALLONS" | "LITERS") {
   let sinceLastFull: FuelLog[] = [];
   for (const log of sorted) {
     sinceLastFull.push(log);
-    if (log.isFull && !log.missedFillUp) {
+
+    if (log.missedFillUp) {
+      // The window ending here is unreliable regardless of isFull; no economy is published.
+      sinceLastFull = log.isFull ? [log] : [];
+      continue;
+    }
+
+    if (log.isFull) {
       const first = sinceLastFull[0]!;
       const distance = log.odometer - first.odometer;
       // Fuel used is everything added strictly after the starting (previous full) fill-up.

@@ -192,22 +192,77 @@ To actually send emails, set in `.env`:
 With `MAIL_PROVIDER=none`, due reminders still appear on the dashboard —
 nothing is emailed.
 
+## Testing
+
+Both apps have unit and integration test suites, run in CI (`.github/workflows/test.yml`)
+on every push/PR and expected to stay green — please add or update tests
+alongside any behavior change rather than after the fact.
+
+**Server** (`server/`): Vitest + Supertest, against a real disposable PostgreSQL
+database (never your dev/prod one).
+
+```bash
+cd server
+createdb car_tracker_test   # once; or set TEST_DATABASE_URL to point elsewhere
+npm test
+```
+
+- Unit tests live next to the code they test (`src/**/*.test.ts`): encryption
+  round-trips and tamper/wrong-key/wrong-passphrase failure modes, TOTP
+  generation/verification and backup codes, and the reminder due/not-due logic
+  for all four trigger types (pure function, driven by an explicit clock —
+  no waiting on real time).
+- Integration tests live in `test/integration/*.test.ts` and drive the real
+  Express app (`src/app.ts`) through Supertest: full register → 2FA enroll →
+  login → verify → refresh → logout, cross-account ownership isolation on
+  every resource, fuel-economy calculation, the reminder sweep end-to-end,
+  and a full export → wipe → import round trip.
+- `test/globalSetup.ts` pushes the current Prisma schema to the test database
+  once before the run; `test/resetDb.ts` truncates all tables between tests
+  so each test starts clean. Tests run serially (`fileParallelism: false`)
+  since they share that one database.
+
+**Client** (`client/`): Vitest + Testing Library, jsdom environment.
+
+```bash
+cd client
+npm test
+```
+
+Covers the API client's request/retry logic (auth header attachment, 401 →
+refresh → retry, concurrent-401 coalescing, error surfacing), the `cn()`
+class-merging utility, and client-side form validation on the register page.
+Most business logic lives server-side (encryption, reminder scheduling, fuel
+math), so the client suite is intentionally lighter — the important thing to
+extend here is anything that becomes real client-side logic (validation,
+derived display state) rather than typical page wiring.
+
 ## Project structure
 
 ```
 server/            Express + Prisma API
   prisma/schema.prisma
   src/
+    app.ts          Express app factory (used by both index.ts and tests)
     auth/           password hashing, TOTP, JWT/session helpers
     crypto/         per-account field encryption, backup-file encryption
     middleware/      auth middleware
     routes/          REST endpoints
     services/        reminder evaluation, cron scheduler, mailer
+    **/*.test.ts     unit tests, next to the code they test
+  test/
+    integration/     Supertest integration tests
+    globalSetup.ts, setup.ts, resetDb.ts, helpers.ts   test harness
+  vitest.config.ts
 client/            React + Vite + Tailwind frontend
   src/
     api/             fetch client, auth context, types
     components/ui/    small shadcn-style UI primitives
     pages/           route-level pages
+    **/*.test.ts(x)  unit/component tests, next to the code they test
+    test/setup.ts     testing-library setup
+  vitest.config.ts
+.github/workflows/test.yml   CI: runs both test suites on push/PR
 docker-compose.yml
 .env.example
 ```
