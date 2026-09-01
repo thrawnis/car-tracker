@@ -1,7 +1,16 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
-import type { Vehicle, MaintenanceRecord, FuelLog, ReminderRule } from "@/api/types";
+import { useVault } from "@/api/vault";
+import type { RawVehicle, RawMaintenanceRecord, RawFuelLog, Vehicle, MaintenanceRecord, FuelLog, ReminderRule } from "@/api/types";
+import {
+  decryptVehicle,
+  encryptVehicleInput,
+  decryptMaintenanceRecord,
+  encryptMaintenanceInput,
+  decryptFuelLog,
+  encryptFuelInput,
+} from "@/api/crypto-mapping";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input, Label, Select, Textarea } from "@/components/ui/input";
@@ -21,12 +30,14 @@ function dollarsToCents(dollars: string): number | null {
 export function VehicleDetailPage() {
   const { vehicleId } = useParams<{ vehicleId: string }>();
   const navigate = useNavigate();
+  const { dataKey } = useVault();
   const [vehicle, setVehicle] = useState<Vehicle | null>(null);
 
   const loadVehicle = useCallback(async () => {
     if (!vehicleId) return;
-    setVehicle(await api.get<Vehicle>(`/vehicles/${vehicleId}`));
-  }, [vehicleId]);
+    const raw = await api.get<RawVehicle>(`/vehicles/${vehicleId}`);
+    setVehicle(await decryptVehicle(raw, dataKey!));
+  }, [vehicleId, dataKey]);
 
   useEffect(() => {
     void loadVehicle();
@@ -84,6 +95,7 @@ export function VehicleDetailPage() {
 }
 
 function OverviewTab({ vehicle, onSaved }: { vehicle: Vehicle; onSaved: () => void }) {
+  const { dataKey } = useVault();
   const [form, setForm] = useState({
     vin: vehicle.vin ?? "",
     licensePlate: vehicle.licensePlate ?? "",
@@ -97,7 +109,8 @@ function OverviewTab({ vehicle, onSaved }: { vehicle: Vehicle; onSaved: () => vo
     e.preventDefault();
     setSaving(true);
     try {
-      await api.patch(`/vehicles/${vehicle.id}`, form);
+      const encrypted = await encryptVehicleInput(form, dataKey!);
+      await api.patch(`/vehicles/${vehicle.id}`, encrypted);
       onSaved();
     } finally {
       setSaving(false);
@@ -162,13 +175,15 @@ function OverviewTab({ vehicle, onSaved }: { vehicle: Vehicle; onSaved: () => vo
 }
 
 function MaintenanceTab({ vehicleId }: { vehicleId: string }) {
+  const { dataKey } = useVault();
   const [records, setRecords] = useState<MaintenanceRecord[] | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ serviceType: "", performedAt: "", odometer: "", vendor: "", cost: "", notes: "" });
 
   const load = useCallback(async () => {
-    setRecords(await api.get<MaintenanceRecord[]>(`/vehicles/${vehicleId}/maintenance`));
-  }, [vehicleId]);
+    const raw = await api.get<RawMaintenanceRecord[]>(`/vehicles/${vehicleId}/maintenance`);
+    setRecords(await Promise.all(raw.map((r) => decryptMaintenanceRecord(r, dataKey!))));
+  }, [vehicleId, dataKey]);
 
   useEffect(() => {
     void load();
@@ -176,14 +191,18 @@ function MaintenanceTab({ vehicleId }: { vehicleId: string }) {
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
-    await api.post(`/vehicles/${vehicleId}/maintenance`, {
-      serviceType: form.serviceType,
-      performedAt: form.performedAt,
-      odometer: form.odometer ? Number(form.odometer) : null,
-      vendor: form.vendor || null,
-      costCents: dollarsToCents(form.cost),
-      notes: form.notes || null,
-    });
+    const encrypted = await encryptMaintenanceInput(
+      {
+        serviceType: form.serviceType,
+        performedAt: form.performedAt,
+        odometer: form.odometer ? Number(form.odometer) : null,
+        vendor: form.vendor || null,
+        costCents: dollarsToCents(form.cost),
+        notes: form.notes || null,
+      },
+      dataKey!,
+    );
+    await api.post(`/vehicles/${vehicleId}/maintenance`, encrypted);
     setForm({ serviceType: "", performedAt: "", odometer: "", vendor: "", cost: "", notes: "" });
     setOpen(false);
     await load();
@@ -284,13 +303,15 @@ function MaintenanceTab({ vehicleId }: { vehicleId: string }) {
 }
 
 function FuelTab({ vehicleId, fuelUnit }: { vehicleId: string; fuelUnit: Vehicle["fuelUnit"] }) {
+  const { dataKey } = useVault();
   const [logs, setLogs] = useState<FuelLog[] | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ filledAt: "", odometer: "", quantity: "", cost: "", isFull: true, missedFillUp: false });
 
   const load = useCallback(async () => {
-    setLogs(await api.get<FuelLog[]>(`/vehicles/${vehicleId}/fuel`));
-  }, [vehicleId]);
+    const raw = await api.get<RawFuelLog[]>(`/vehicles/${vehicleId}/fuel`);
+    setLogs(await Promise.all(raw.map((l) => decryptFuelLog(l, dataKey!))));
+  }, [vehicleId, dataKey]);
 
   useEffect(() => {
     void load();
@@ -298,14 +319,18 @@ function FuelTab({ vehicleId, fuelUnit }: { vehicleId: string; fuelUnit: Vehicle
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
-    await api.post(`/vehicles/${vehicleId}/fuel`, {
-      filledAt: form.filledAt,
-      odometer: Number(form.odometer),
-      quantity: Number(form.quantity),
-      totalCostCents: dollarsToCents(form.cost),
-      isFull: form.isFull,
-      missedFillUp: form.missedFillUp,
-    });
+    const encrypted = await encryptFuelInput(
+      {
+        filledAt: form.filledAt,
+        odometer: Number(form.odometer),
+        quantity: Number(form.quantity),
+        totalCostCents: dollarsToCents(form.cost),
+        isFull: form.isFull,
+        missedFillUp: form.missedFillUp,
+      },
+      dataKey!,
+    );
+    await api.post(`/vehicles/${vehicleId}/fuel`, encrypted);
     setForm({ filledAt: "", odometer: "", quantity: "", cost: "", isFull: true, missedFillUp: false });
     setOpen(false);
     await load();

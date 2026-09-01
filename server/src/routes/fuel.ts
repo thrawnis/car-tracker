@@ -4,13 +4,13 @@ import { prisma } from "../lib/db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { loadOwnedVehicle, vehicleIdParam } from "../lib/ownership.js";
 import { recordOdometerReading } from "../lib/odometer.js";
-import type { AccountCipher } from "../crypto/encryption.js";
 import type { FuelLog } from "@prisma/client";
 
 export const fuelRouter = Router({ mergeParams: true });
 fuelRouter.use(requireAuth);
 
-function serialize(f: FuelLog, cipher: AccountCipher) {
+// notesEncrypted is opaque client-side ciphertext, passed through unchanged.
+function serialize(f: FuelLog) {
   return {
     id: f.id,
     vehicleId: f.vehicleId,
@@ -21,7 +21,7 @@ function serialize(f: FuelLog, cipher: AccountCipher) {
     totalCostCents: f.totalCostCents,
     missedFillUp: f.missedFillUp,
     isFull: f.isFull,
-    notes: cipher.decrypt(f.notesEncrypted),
+    notesEncrypted: f.notesEncrypted,
     createdAt: f.createdAt,
   };
 }
@@ -34,7 +34,7 @@ const schema = z.object({
   totalCostCents: z.number().int().nonnegative().nullable().optional(),
   missedFillUp: z.boolean().optional(),
   isFull: z.boolean().optional(),
-  notes: z.string().max(2000).nullable().optional(),
+  notesEncrypted: z.string().max(8000).nullable().optional(),
 });
 
 /**
@@ -89,7 +89,7 @@ fuelRouter.get("/", async (req, res) => {
 
   res.json(
     logs.map((l) => ({
-      ...serialize(l, req.cipher!),
+      ...serialize(l),
       economy: economyByLogId.get(l.id)?.economy ?? null,
     })),
   );
@@ -104,7 +104,6 @@ fuelRouter.post("/", async (req, res) => {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
     return;
   }
-  const cipher = req.cipher!;
   const d = parsed.data;
 
   const log = await prisma.fuelLog.create({
@@ -117,13 +116,13 @@ fuelRouter.post("/", async (req, res) => {
       totalCostCents: d.totalCostCents ?? null,
       missedFillUp: d.missedFillUp ?? false,
       isFull: d.isFull ?? true,
-      notesEncrypted: cipher.encrypt(d.notes),
+      notesEncrypted: d.notesEncrypted ?? null,
     },
   });
 
   await recordOdometerReading(vehicle.id, d.odometer, d.filledAt, "fuel_log");
 
-  res.status(201).json(serialize(log, cipher));
+  res.status(201).json(serialize(log));
 });
 
 async function loadOwnedLog(req: import("express").Request, res: import("express").Response, id: string) {
@@ -144,7 +143,6 @@ fuelRouter.patch("/:id", async (req, res) => {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
     return;
   }
-  const cipher = req.cipher!;
   const d = parsed.data;
 
   const updated = await prisma.fuelLog.update({
@@ -157,11 +155,11 @@ fuelRouter.patch("/:id", async (req, res) => {
       ...(d.totalCostCents !== undefined ? { totalCostCents: d.totalCostCents } : {}),
       ...(d.missedFillUp !== undefined ? { missedFillUp: d.missedFillUp } : {}),
       ...(d.isFull !== undefined ? { isFull: d.isFull } : {}),
-      ...(d.notes !== undefined ? { notesEncrypted: cipher.encrypt(d.notes) } : {}),
+      ...(d.notesEncrypted !== undefined ? { notesEncrypted: d.notesEncrypted } : {}),
     },
   });
 
-  res.json(serialize(updated, cipher));
+  res.json(serialize(updated));
 });
 
 fuelRouter.delete("/:id", async (req, res) => {

@@ -1,6 +1,7 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { Car, LayoutDashboard, Settings, LogOut } from "lucide-react";
 import { useAuth } from "@/api/auth";
+import { useVault } from "@/api/vault";
 import { cn } from "@/lib/utils";
 
 const navItems = [
@@ -11,6 +12,12 @@ const navItems = [
 
 export function AppLayout() {
   const { logout } = useAuth();
+  const { setDataKey } = useVault();
+
+  async function onLogout() {
+    await logout();
+    setDataKey(null);
+  }
 
   return (
     <div className="min-h-screen pb-16 sm:pb-0 sm:pl-56">
@@ -36,7 +43,7 @@ export function AppLayout() {
           ))}
         </nav>
         <button
-          onClick={() => void logout()}
+          onClick={() => void onLogout()}
           className="flex items-center gap-2 rounded-md px-2 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100"
         >
           <LogOut className="h-4 w-4" /> Log out

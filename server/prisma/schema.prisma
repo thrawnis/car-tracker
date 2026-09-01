@@ -41,15 +41,32 @@ model User {
   passwordHash          String
   emailVerified         Boolean  @default(false)
 
-  // TOTP 2FA - mandatory for all accounts
+  // TOTP 2FA - mandatory for all accounts. The TOTP secret is an auth
+  // credential the server must be able to verify pre-session, so it uses its
+  // own server-controlled envelope key (totpKeyWrapped, wrapped with the
+  // server MASTER_ENCRYPTION_KEY) - entirely separate from the zero-knowledge
+  // vault below, which the server can never unwrap.
+  totpKeyWrapped        String?
   totpSecretEncrypted   String?
   totpEnabled           Boolean  @default(false)
   totpBackupCodesHashed String[] @default([])
 
-  // Per-account encryption: a random data key is generated at signup,
-  // wrapped (encrypted) with the server master key. All sensitive
-  // fields for this user's data are encrypted with the unwrapped data key.
-  wrappedDataKey        String
+  // Zero-knowledge vault: a random data key is generated CLIENT-SIDE at
+  // signup and never leaves the browser in plaintext. It is wrapped two
+  // ways, both computed client-side:
+  //   - vaultKeyWrappedByPassword: wrapped with a PBKDF2(vaultSalt, password)
+  //     key. The server stores vaultSalt/this blob but never sees the
+  //     password-derived key or the raw data key.
+  //   - vaultKeyWrappedByRecovery: wrapped with an HKDF-derived key from a
+  //     one-time recovery key shown to the user once at signup and never
+  //     stored anywhere. recoveryVerifier is a *different* HKDF output from
+  //     the same recovery key (domain-separated, so it reveals nothing about
+  //     the unwrap key) that lets the server gate password recovery without
+  //     ever being able to derive the unwrap key itself.
+  vaultSalt                String
+  vaultKeyWrappedByPassword String
+  vaultKeyWrappedByRecovery String
+  recoveryVerifier          String
 
   timezone              String   @default("UTC")
   reminderEmail         String?

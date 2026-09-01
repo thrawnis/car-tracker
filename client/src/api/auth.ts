@@ -7,6 +7,10 @@ export interface Me {
   timezone: string;
   reminderEmail: string | null;
   reminderLeadDays: number;
+  // Opaque vault-unwrap material - safe to hold in auth state; useless without
+  // the account's password or recovery key. See crypto/vault.ts.
+  vaultSalt: string;
+  vaultKeyWrappedByPassword: string;
 }
 
 interface AuthContextValue {

@@ -7,57 +7,115 @@ interval, a mileage interval, whichever comes first, or a one-time date.
 ## Stack
 
 - **Backend**: Node.js + TypeScript, Express, PostgreSQL via Prisma
-- **Frontend**: React + Vite + Tailwind CSS, React Router
+- **Frontend**: React + Vite + Tailwind CSS, React Router, Web Crypto API
 - **Auth**: email + password, with mandatory TOTP two-factor authentication
   on every account (no accounts without 2FA)
-- **Encryption**: sensitive fields (VIN, license plate, notes, vendor, cost,
-  TOTP secret) are encrypted at rest with a per-account data key
+- **Encryption**: zero-knowledge, client-side. Sensitive fields (VIN, license
+  plate, notes, vendor, cost) are encrypted and decrypted in the browser with
+  a key the server never has — see Security model below.
 - **Email**: pluggable — SMTP or Resend, configured via environment variables
 - **Deployment**: Docker Compose (Postgres + API server + static frontend
   behind nginx)
 
 ## Security model
 
-- **Passwords**: hashed with Argon2id.
-- **2FA**: TOTP (RFC 6238) is required to finish account setup — there is no
-  way to use the app without it. 10 single-use backup codes are issued once,
-  at enrollment, for account recovery if you lose your authenticator.
-- **Sessions**: short-lived JWT access tokens (15 min, kept in memory in the
-  browser tab) plus a rotating refresh token in an `HttpOnly`, `SameSite=Lax`
-  cookie. Each refresh rotates the token and revokes the old one.
-- **Per-account encryption**: at signup, each account gets a random 256-bit
-  data key. That key is used to encrypt sensitive fields (VIN, license plate,
-  vehicle notes, maintenance vendor/notes/cost, fuel-log notes, the TOTP
-  secret) with AES-256-GCM before they're written to the database. The data
-  key itself is "wrapped" (encrypted) with a single server-wide
-  `MASTER_ENCRYPTION_KEY` and stored alongside the account.
+This app is built so that **the server cannot decrypt your vehicle data,
+under any circumstances** — not with database access, not with its
+environment variables, not with its source code. That's a deliberate,
+significant constraint, and it shapes several things below that would
+otherwise be simpler. If you haven't worked with a zero-knowledge design
+before, read this section in full before relying on it.
 
-  **What this protects against:** someone who obtains a copy of the database
-  alone (a stolen backup, a leaked disk snapshot) cannot read any account's
-  sensitive fields without also having the master key. Each account's data is
-  encrypted independently, so a compromise of one account's key (which never
-  happens in normal operation — it's never exposed to the account itself)
-  wouldn't expose others.
+### The vault key
 
-  **What this does *not* protect against:** the application server, since it
-  holds the master key, can decrypt any account's data — this is an envelope
-  encryption model, not a zero-knowledge one. If you need the server itself
-  to be unable to read your data, that requires a different architecture
-  (client-side encryption with a key derived from your password, never sent
-  to the server) — a reasonable future enhancement, not implemented here.
+At signup, your browser (never the server) generates a random 256-bit AES
+key — the **data key** — and uses it to encrypt every sensitive field (VIN,
+license plate, vehicle notes, maintenance vendor/notes/cost, fuel-log notes)
+with AES-256-GCM before it's ever sent over the network. The server only
+ever stores and returns these opaque ciphertext blobs; it has no code path
+that decrypts them (see `server/src/routes/vehicles.ts` etc. — there is
+simply no cipher there to call). All of that crypto lives in
+`client/src/crypto/vault.ts` and runs via the browser's Web Crypto API.
 
-  **Losing `MASTER_ENCRYPTION_KEY` permanently destroys access to every
-  account's encrypted fields.** Back it up somewhere safe and separate from
-  your database backups.
+The data key itself needs to survive between logins without being stored in
+recoverable plaintext anywhere, so it's **wrapped** (encrypted) two
+different ways, both computed client-side at signup:
 
-- **Backups**: the in-app "Export a backup" feature (Settings page) produces
-  a single file containing all of an account's vehicles, maintenance, fuel,
-  and reminder data, encrypted with a passphrase you choose at export time
-  (scrypt-derived key, AES-256-GCM). This is separate from the account's
-  server-side encryption key, so you can safely store backup files anywhere
-  (cloud storage, email to yourself, etc.) — they're only readable with the
-  passphrase. "Restore a backup" decrypts and re-imports a file, **replacing**
-  all vehicles/history currently in the signed-in account.
+1. **By your password** — a key derived from your password via PBKDF2
+   (600,000 iterations, SHA-256) plus a random salt. This is what unlocks
+   the vault on every normal login.
+2. **By a one-time recovery key** — a separate random 256-bit value, shown
+   to you exactly once at signup and never stored anywhere (not by us, not
+   in the database). It's your only way back in if you forget your
+   password.
+
+The server stores both wrapped copies (`vaultKeyWrappedByPassword`,
+`vaultKeyWrappedByRecovery`) plus the salt. All three are useless without
+the password or the recovery key — there is no field, function, or
+environment variable on the server that can turn them back into the data
+key.
+
+**This means:**
+
+- **Losing both your password and your recovery key permanently and
+  irreversibly loses access to your data.** There is no "reset password and
+  keep your data" support option — the whole point is that we cannot offer
+  one. Save your recovery key somewhere durable (a password manager, printed
+  and filed) the moment it's shown to you.
+- **Your vault "locks" on every page refresh.** The data key lives only in
+  browser memory for the current tab — never `localStorage`, never a
+  cookie — so a refresh (or the access-token-refresh flow silently renewing
+  your session) loses it. You'll see an "Unlock your vault" prompt asking
+  for your password again; this is expected, not a bug, and requires no
+  network round trip to resolve (the salt and wrapped key needed are already
+  in hand from your session).
+- **Changing your password isn't supported yet.** The recovery-key flow
+  (Settings → "Forgot password?" from the login page) is currently the only
+  way to rotate your password, and it revokes all of your sessions when it
+  succeeds. A dedicated in-session "change password" flow is a natural
+  follow-up, not yet built.
+
+### What's deliberately *not* zero-knowledge
+
+Two things are exceptions, both auth mechanics rather than your data:
+
+- **The TOTP secret.** Verifying a 2FA code has to happen server-side,
+  before you've done anything that could hand the server a decryption key —
+  so the TOTP secret uses its own, separate server-controlled envelope (a
+  random per-account key wrapped with the server's `MASTER_ENCRYPTION_KEY`),
+  same as a conventional app. Losing `MASTER_ENCRYPTION_KEY` breaks
+  everyone's 2FA (they'd need to re-enroll) but does **not** expose any
+  vehicle data — the two encryption systems don't share key material.
+- **Non-sensitive fields** (year, make, model, ownership status, dates,
+  odometer readings, fuel quantity/cost, reminder rule names/intervals) are
+  stored in plaintext, same as before. They're needed for filtering/sorting
+  and aren't considered sensitive. Only the fields listed above under "The
+  vault key" are encrypted.
+
+### Sessions
+
+Argon2id password hashing, short-lived JWT access tokens (15 min, kept in
+memory in the browser tab) plus a rotating refresh token in an `HttpOnly`,
+`SameSite=Lax` cookie. Each refresh rotates the token and revokes the old
+one. 10 single-use TOTP backup codes are issued once, at 2FA enrollment.
+
+### Backups
+
+The in-app "Export a backup" feature (Settings page) runs **entirely in your
+browser**: it fetches your already-encrypted vehicle/maintenance/fuel data
+(the server never decrypts it to build the file), wraps your data key with a
+passphrase you choose (fresh salt, same PBKDF2+AES-GCM scheme as above), and
+bundles both into one downloadable file. The server is not involved in the
+encryption at all — see `server/src/routes/backup.ts`, which just relays
+your already-encrypted rows verbatim.
+
+"Restore a backup" reverses this client-side: unwraps the file's data key
+with the passphrase you enter, and re-encrypts every field with your
+*current* account's data key before uploading (this also makes it possible,
+in principle, to restore a backup into a different account than the one
+that made it — the re-encryption step handles the key mismatch
+transparently). Restoring **replaces** all vehicles/history currently in the
+signed-in account.
 
 ## Local development
 
@@ -102,8 +160,10 @@ cp .env.example .env
 Fill in `.env`:
 
 - `POSTGRES_PASSWORD` — any strong password.
-- `MASTER_ENCRYPTION_KEY` — generate with `openssl rand -base64 32`. **Back
-  this up separately from your database backups** (see Security model above).
+- `MASTER_ENCRYPTION_KEY` — generate with `openssl rand -base64 32`. This
+  protects only the TOTP secrets used for 2FA login, not vehicle data (which
+  is zero-knowledge — see Security model above). Losing it means every
+  account needs to re-enroll in 2FA, but no vehicle data is lost.
 - `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` — generate each with
   `openssl rand -base64 48`.
 - `APP_URL` / `HTTP_PORT` — adjust if you're putting this behind your own
@@ -159,9 +219,11 @@ Postgres volume regularly, e.g.:
 docker compose exec db pg_dump -U car_tracker car_tracker > backup.sql
 ```
 
-Store `MASTER_ENCRYPTION_KEY` (from your `.env`) alongside these backups —
-without it, a restored database's encrypted fields (VINs, notes, costs, TOTP
-secrets) are unreadable.
+A `pg_dump` alone is enough to restore vehicle data — it's already
+zero-knowledge ciphertext in the dump, unlockable by each account's own
+password or recovery key, not by any server-held key. `MASTER_ENCRYPTION_KEY`
+only needs to travel with the dump if you also want restored accounts' 2FA
+(TOTP) to keep working without re-enrolling.
 
 ## Reminder emails
 
@@ -207,16 +269,27 @@ createdb car_tracker_test   # once; or set TEST_DATABASE_URL to point elsewhere
 npm test
 ```
 
-- Unit tests live next to the code they test (`src/**/*.test.ts`): encryption
-  round-trips and tamper/wrong-key/wrong-passphrase failure modes, TOTP
-  generation/verification and backup codes, and the reminder due/not-due logic
-  for all four trigger types (pure function, driven by an explicit clock —
-  no waiting on real time).
+- Unit tests live next to the code they test (`src/**/*.test.ts`): the TOTP
+  envelope (an `AccountCipher`/master-key round trip, used only for the 2FA
+  secret), the recovery-verifier constant-time comparison, and the reminder
+  due/not-due logic for all four trigger types (pure function, driven by an
+  explicit clock — no waiting on real time). Note there's no server-side
+  "encrypt vehicle data" unit test to write — that logic doesn't exist here
+  by design; see the client suite below.
 - Integration tests live in `test/integration/*.test.ts` and drive the real
   Express app (`src/app.ts`) through Supertest: full register → 2FA enroll →
-  login → verify → refresh → logout, cross-account ownership isolation on
-  every resource, fuel-economy calculation, the reminder sweep end-to-end,
-  and a full export → wipe → import round trip.
+  login → verify → refresh → logout, the account-recovery flow end to end,
+  cross-account ownership isolation on every resource, fuel-economy
+  calculation, the reminder sweep end-to-end, and a full export → wipe →
+  import round trip (including simulating a restore into a *different*
+  account, which requires client-side re-encryption).
+- **`test/helpers.ts` imports `client/src/crypto/vault.ts` directly** rather
+  than reimplementing its own copy of the crypto. Server integration tests
+  therefore act as a real "browser stand-in": they generate and wrap data
+  keys, encrypt fields, and derive recovery proofs exactly as the frontend
+  does, so the tests genuinely exercise the zero-knowledge protocol rather
+  than a simplified version of it. If you change how the client wraps or
+  encrypts something, these tests pick it up for free.
 - `test/globalSetup.ts` pushes the current Prisma schema to the test database
   once before the run; `test/resetDb.ts` truncates all tables between tests
   so each test starts clean. Tests run serially (`fileParallelism: false`)
@@ -229,36 +302,51 @@ cd client
 npm test
 ```
 
-Covers the API client's request/retry logic (auth header attachment, 401 →
-refresh → retry, concurrent-401 coalescing, error surfacing), the `cn()`
-class-merging utility, and client-side form validation on the register page.
-Most business logic lives server-side (encryption, reminder scheduling, fuel
-math), so the client suite is intentionally lighter — the important thing to
-extend here is anything that becomes real client-side logic (validation,
-derived display state) rather than typical page wiring.
+This is where the real cryptographic unit tests live, since that's where the
+crypto lives now: `crypto/vault.test.ts` covers password/recovery-key
+wrapping and unwrapping (including wrong-password and wrong-recovery-key
+failure modes), field encrypt/decrypt round trips, and the independence of
+the two HKDF outputs derived from one recovery key. `crypto/backup.test.ts`
+covers the export/import passphrase wrapping and the re-encryption path used
+when restoring into a different account's data key. Also covered: the API
+client's request/retry logic (auth header attachment, 401 → refresh → retry,
+concurrent-401 coalescing), the `cn()` class-merging utility, and
+client-side form validation on the register page.
 
 ## Project structure
 
 ```
-server/            Express + Prisma API
+server/            Express + Prisma API - stores only opaque ciphertext for
+                   vehicle data; cannot decrypt it (see Security model)
   prisma/schema.prisma
   src/
     app.ts          Express app factory (used by both index.ts and tests)
     auth/           password hashing, TOTP, JWT/session helpers
-    crypto/         per-account field encryption, backup-file encryption
+    crypto/         master-key envelope for the TOTP secret ONLY - not
+                     used for vehicle/maintenance/fuel data
     middleware/      auth middleware
-    routes/          REST endpoints
+    routes/          REST endpoints (vehicles/maintenance/fuel/backup are
+                     opaque-blob pass-through; auth handles the vault-wrap
+                     fields and account recovery)
     services/        reminder evaluation, cron scheduler, mailer
     **/*.test.ts     unit tests, next to the code they test
   test/
     integration/     Supertest integration tests
     globalSetup.ts, setup.ts, resetDb.ts, helpers.ts   test harness
+                     (helpers.ts imports client/src/crypto/vault.ts directly
+                     to act as a real "browser" in these tests)
   vitest.config.ts
 client/            React + Vite + Tailwind frontend
   src/
-    api/             fetch client, auth context, types
+    crypto/          vault.ts (Web Crypto: key derivation, field
+                     encrypt/decrypt, recovery-key HKDF), backup.ts
+                     (client-side export/import), pending.ts (in-memory
+                     handoff of sensitive values between auth-flow pages)
+    api/             fetch client, auth + vault contexts, crypto-mapping.ts
+                     (encrypt/decrypt helpers per entity), types
     components/ui/    small shadcn-style UI primitives
-    pages/           route-level pages
+    pages/           route-level pages (RecoveryKeyPage, UnlockPage,
+                     ForgotPasswordPage are new for the zero-knowledge flow)
     **/*.test.ts(x)  unit/component tests, next to the code they test
     test/setup.ts     testing-library setup
   vitest.config.ts

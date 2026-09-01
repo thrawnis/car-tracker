@@ -1,7 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/db.js";
 import { verifyAccessToken } from "../auth/tokens.js";
-import { unwrapDataKey, AccountCipher } from "../crypto/encryption.js";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -9,11 +8,14 @@ declare global {
     interface Request {
       userId?: string;
       sessionId?: string;
-      cipher?: AccountCipher;
     }
   }
 }
 
+// Deliberately no per-account cipher here: the server has no key that can
+// decrypt vehicle/maintenance/fuel data (see prisma/schema.prisma User model
+// and client/src/crypto/vault.ts). All routes below this middleware treat
+// "*Encrypted" fields as opaque blobs the client encrypted and will decrypt.
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   const token = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
@@ -33,7 +35,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     req.userId = user.id;
     req.sessionId = payload.sid;
-    req.cipher = new AccountCipher(unwrapDataKey(user.wrappedDataKey));
     next();
   } catch {
     res.status(401).json({ error: "Not authenticated" });

@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useAuth } from "@/api/auth";
-import { api, getAccessToken } from "@/api/client";
+import { useVault } from "@/api/vault";
+import { api } from "@/api/client";
+import { exportBackup, unlockBackupFile, reencryptForImport } from "@/crypto/backup";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
@@ -82,7 +84,7 @@ function ReminderPrefsCard({ user, onSaved }: { user: ReturnType<typeof useAuth>
 }
 
 function ExportCard() {
-  const [password, setPassword] = useState("");
+  const { dataKey } = useVault();
   const [passphrase, setPassphrase] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -92,29 +94,20 @@ function ExportCard() {
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch("/api/backup/export", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          ...(getAccessToken() ? { Authorization: `Bearer ${getAccessToken()}` } : {}),
-        },
-        body: JSON.stringify({ password, passphrase }),
-      });
-      if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(data.error ?? "Export failed");
-        return;
-      }
-      const blob = await res.blob();
+      // Everything here happens in the browser: the server only ever sees the
+      // GET request for already-encrypted vehicle data (below) - never the
+      // passphrase, the data key, or anything decrypted.
+      const file = await exportBackup(dataKey!, passphrase);
+      const blob = new Blob([file], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `car-tracker-backup-${Date.now()}.ctbackup`;
       a.click();
       URL.revokeObjectURL(url);
-      setPassword("");
       setPassphrase("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Export failed");
     } finally {
       setBusy(false);
     }
@@ -125,22 +118,13 @@ function ExportCard() {
       <CardHeader>
         <CardTitle>Export a backup</CardTitle>
         <CardDescription>
-          Downloads all of your vehicles, maintenance, fuel, and reminder data as one file, encrypted with a
-          passphrase you choose. Keep the passphrase somewhere safe — it's the only way to decrypt the file.
+          Downloads all of your vehicles, maintenance, fuel, and reminder data as one file, encrypted entirely in
+          your browser with a passphrase you choose. Keep the passphrase somewhere safe — it's the only way to
+          decrypt the file, and we can't recover it for you.
         </CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={onExport} className="flex flex-col gap-4 sm:max-w-sm">
-          <div>
-            <Label htmlFor="exportPassword">Your account password</Label>
-            <Input
-              id="exportPassword"
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </div>
           <div>
             <Label htmlFor="exportPassphrase">Backup file passphrase</Label>
             <Input
@@ -163,6 +147,7 @@ function ExportCard() {
 }
 
 function ImportCard() {
+  const { dataKey } = useVault();
   const [password, setPassword] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -184,13 +169,18 @@ function ImportCard() {
     setBusy(true);
     try {
       const fileContents = await file.text();
-      await api.post("/backup/import", { password, passphrase, fileContents, confirmReplace: true });
+      // Decrypt with the backup's own passphrase, then re-encrypt every field
+      // for this account's data key - both entirely client-side. The server
+      // only ever receives ciphertext already valid for this account.
+      const { backupDataKey, vehicles } = await unlockBackupFile(fileContents, passphrase);
+      const reencrypted = await reencryptForImport(vehicles, backupDataKey, dataKey!);
+      await api.post("/backup/import-data", { password, confirmReplace: true, vehicles: reencrypted });
       setSuccess(true);
       setPassword("");
       setPassphrase("");
       setFile(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
+      setError(err instanceof Error ? err.message : "Import failed - check your passphrase and try again");
     } finally {
       setBusy(false);
     }

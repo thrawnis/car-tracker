@@ -3,7 +3,7 @@ import type { Express } from "express";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { resetDb } from "../resetDb.js";
-import { createAccount, authedRequest } from "../helpers.js";
+import { createAccount, authedRequest, encryptField, decryptField } from "../helpers.js";
 import { prisma } from "../../src/lib/db.js";
 
 let app: Express;
@@ -17,21 +17,38 @@ beforeEach(async () => {
 });
 
 describe("vehicle CRUD", () => {
-  it("creates a vehicle and encrypts sensitive fields at rest", async () => {
+  it("stores sensitive fields as opaque ciphertext, verbatim - the server never touches them", async () => {
     const account = await createAccount(app);
     const authed = authedRequest(app, account);
 
+    const vinEncrypted = await encryptField("1HGCM82633A004352", account.dataKey);
+    const notesEncrypted = await encryptField("test notes", account.dataKey);
+
     const res = await authed
       .post("/api/vehicles")
-      .send({ year: 2020, make: "Honda", model: "Civic", vin: "1HGCM82633A004352", notes: "test notes" })
+      .send({ year: 2020, make: "Honda", model: "Civic", vinEncrypted, notesEncrypted })
       .expect(201);
 
-    expect(res.body.vin).toBe("1HGCM82633A004352");
-    expect(res.body.notes).toBe("test notes");
+    // Pure pass-through: the response's ciphertext is byte-for-byte what we sent.
+    expect(res.body.vinEncrypted).toBe(vinEncrypted);
+    expect(res.body.notesEncrypted).toBe(notesEncrypted);
+    expect(await decryptField(res.body.vinEncrypted, account.dataKey)).toBe("1HGCM82633A004352");
 
     const row = await prisma.vehicle.findUniqueOrThrow({ where: { id: res.body.id } });
+    expect(row.vinEncrypted).toBe(vinEncrypted);
     expect(row.vinEncrypted).not.toContain("1HGCM82633A004352");
     expect(row.notesEncrypted).not.toContain("test notes");
+  });
+
+  it("a different account's data key cannot decrypt another account's fields", async () => {
+    const owner = await createAccount(app);
+    const other = await createAccount(app);
+    const vinEncrypted = await encryptField("1HGCM82633A004352", owner.dataKey);
+
+    const res = await authedRequest(app, owner).post("/api/vehicles").send({ make: "Honda", vinEncrypted }).expect(201);
+
+    expect(await decryptField(res.body.vinEncrypted, other.dataKey)).toBeNull();
+    expect(await decryptField(res.body.vinEncrypted, owner.dataKey)).toBe("1HGCM82633A004352");
   });
 
   it("lists only the requesting account's vehicles", async () => {
@@ -82,14 +99,16 @@ describe("vehicle CRUD", () => {
   it("updates fields via PATCH, including re-encrypting sensitive fields", async () => {
     const account = await createAccount(app);
     const authed = authedRequest(app, account);
-    const created = await authed.post("/api/vehicles").send({ make: "Honda", vin: "OLDVIN" }).expect(201);
+    const oldVinEncrypted = await encryptField("OLDVIN", account.dataKey);
+    const created = await authed.post("/api/vehicles").send({ make: "Honda", vinEncrypted: oldVinEncrypted }).expect(201);
 
+    const newVinEncrypted = await encryptField("NEWVIN123", account.dataKey);
     const updated = await authed
       .patch(`/api/vehicles/${created.body.id}`)
-      .send({ vin: "NEWVIN123", ownershipStatus: "SOLD" })
+      .send({ vinEncrypted: newVinEncrypted, ownershipStatus: "SOLD" })
       .expect(200);
 
-    expect(updated.body.vin).toBe("NEWVIN123");
+    expect(await decryptField(updated.body.vinEncrypted, account.dataKey)).toBe("NEWVIN123");
     expect(updated.body.ownershipStatus).toBe("SOLD");
     expect(updated.body.make).toBe("Honda");
   });

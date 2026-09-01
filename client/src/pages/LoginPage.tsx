@@ -3,6 +3,7 @@ import { useNavigate, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
+import { setPendingPassword } from "@/crypto/pending";
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -32,6 +33,9 @@ export function LoginPage() {
         setError(data.error ?? "Login failed");
         return;
       }
+      // Held in memory only: needed one more step further, to derive the vault
+      // key once TOTP verification confirms the session.
+      setPendingPassword(password);
       navigate("/totp-verify", { state: { mfaToken: data.mfaToken } });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
@@ -54,7 +58,12 @@ export function LoginPage() {
               <Input id="email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
             </div>
             <div>
-              <Label htmlFor="password">Password</Label>
+              <div className="flex items-center justify-between">
+                <Label htmlFor="password">Password</Label>
+                <Link to="/forgot-password" className="text-xs text-brand-600 hover:underline">
+                  Forgot password?
+                </Link>
+              </div>
               <Input
                 id="password"
                 type="password"

@@ -1,12 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  generateDataKey,
-  wrapDataKey,
-  unwrapDataKey,
-  AccountCipher,
-  encryptExportPayload,
-  decryptExportPayload,
-} from "./encryption.js";
+import { generateDataKey, wrapDataKey, unwrapDataKey, AccountCipher, safeCompareB64 } from "./encryption.js";
 
 describe("data key wrapping", () => {
   it("round-trips a data key through wrap/unwrap", () => {
@@ -60,21 +53,17 @@ describe("AccountCipher", () => {
   });
 });
 
-describe("export/import passphrase encryption", () => {
-  it("round-trips an arbitrary payload with the correct passphrase", () => {
-    const payload = { vehicles: [{ make: "Honda", model: "Civic" }] };
-    const file = encryptExportPayload(payload, "correct horse battery staple");
-    expect(decryptExportPayload(file, "correct horse battery staple")).toEqual(payload);
+describe("safeCompareB64", () => {
+  it("returns true for identical base64 values", () => {
+    const value = Buffer.from("some verifier bytes").toString("base64");
+    expect(safeCompareB64(value, value)).toBe(true);
   });
 
-  it("fails to decrypt with the wrong passphrase", () => {
-    const file = encryptExportPayload({ a: 1 }, "right passphrase");
-    expect(() => decryptExportPayload(file, "wrong passphrase")).toThrow();
-  });
-
-  it("rejects a file with an unsupported version", () => {
-    const file = encryptExportPayload({ a: 1 }, "pw");
-    const tampered = JSON.stringify({ ...JSON.parse(file), v: 99 });
-    expect(() => decryptExportPayload(tampered, "pw")).toThrow(/version/i);
+  it("returns false for different values, including different lengths", () => {
+    const a = Buffer.from("verifier-a").toString("base64");
+    const b = Buffer.from("verifier-b").toString("base64");
+    const shorter = Buffer.from("short").toString("base64");
+    expect(safeCompareB64(a, b)).toBe(false);
+    expect(safeCompareB64(a, shorter)).toBe(false);
   });
 });

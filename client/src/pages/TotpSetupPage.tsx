@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { setAccessToken } from "@/api/client";
 import { useAuth } from "@/api/auth";
+import { useVault } from "@/api/vault";
+import { takePendingDataKey } from "@/crypto/pending";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -10,6 +12,7 @@ export function TotpSetupPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const { refreshUser } = useAuth();
+  const { setDataKey } = useVault();
   const enrollToken = (location.state as { enrollToken?: string } | null)?.enrollToken;
 
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
@@ -64,6 +67,9 @@ export function TotpSetupPage() {
   }
 
   async function onDone() {
+    // The data key generated at registration (RegisterPage) has been sitting in
+    // memory since; this is where it finally becomes the active vault key.
+    setDataKey(takePendingDataKey());
     await refreshUser();
     navigate("/", { replace: true });
   }

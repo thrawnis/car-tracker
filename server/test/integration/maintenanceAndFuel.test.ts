@@ -2,7 +2,8 @@ import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import type { Express } from "express";
 import { createApp } from "../../src/app.js";
 import { resetDb } from "../resetDb.js";
-import { createAccount, authedRequest } from "../helpers.js";
+import { createAccount, authedRequest, encryptField, decryptField } from "../helpers.js";
+import { prisma } from "../../src/lib/db.js";
 
 let app: Express;
 
@@ -25,21 +26,29 @@ describe("maintenance records", () => {
     const authed = authedRequest(app, account);
     const vehicleId = await makeVehicle(authed);
 
+    const vendorEncrypted = await encryptField("Jiffy Lube", account.dataKey);
+    const costCentsEncrypted = await encryptField("4500", account.dataKey);
+    const notesEncrypted = await encryptField("synthetic oil", account.dataKey);
+
     const res = await authed
       .post(`/api/vehicles/${vehicleId}/maintenance`)
       .send({
         serviceType: "Oil Change",
         performedAt: "2026-01-01",
         odometer: 10000,
-        vendor: "Jiffy Lube",
-        costCents: 4500,
-        notes: "synthetic oil",
+        vendorEncrypted,
+        costCentsEncrypted,
+        notesEncrypted,
       })
       .expect(201);
 
-    expect(res.body.vendor).toBe("Jiffy Lube");
-    expect(res.body.costCents).toBe(4500);
-    expect(res.body.notes).toBe("synthetic oil");
+    expect(await decryptField(res.body.vendorEncrypted, account.dataKey)).toBe("Jiffy Lube");
+    expect(await decryptField(res.body.costCentsEncrypted, account.dataKey)).toBe("4500");
+    expect(await decryptField(res.body.notesEncrypted, account.dataKey)).toBe("synthetic oil");
+
+    // The server just relays what it was given - it never sees "4500" itself.
+    const row = await prisma.maintenanceRecord.findUniqueOrThrow({ where: { id: res.body.id } });
+    expect(row.costCentsEncrypted).toBe(costCentsEncrypted);
 
     const odometer = await authed.get(`/api/vehicles/${vehicleId}/odometer`).expect(200);
     expect(odometer.body[0].odometer).toBe(10000);

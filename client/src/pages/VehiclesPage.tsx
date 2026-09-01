@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/api/client";
-import type { Vehicle } from "@/api/types";
+import { useVault } from "@/api/vault";
+import type { RawVehicle, Vehicle } from "@/api/types";
+import { decryptVehicle, encryptVehicleInput } from "@/api/crypto-mapping";
 import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -10,29 +12,35 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Plus } from "lucide-react";
 
 export function VehiclesPage() {
+  const { dataKey } = useVault();
   const [vehicles, setVehicles] = useState<Vehicle[] | null>(null);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ year: "", make: "", model: "", nickname: "" });
   const [error, setError] = useState<string | null>(null);
 
-  async function load() {
-    setVehicles(await api.get<Vehicle[]>("/vehicles"));
-  }
+  const load = useCallback(async () => {
+    const raw = await api.get<RawVehicle[]>("/vehicles");
+    setVehicles(await Promise.all(raw.map((v) => decryptVehicle(v, dataKey!))));
+  }, [dataKey]);
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [load]);
 
   async function onCreate(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     try {
-      await api.post("/vehicles", {
-        year: form.year ? Number(form.year) : null,
-        make: form.make || null,
-        model: form.model || null,
-        nickname: form.nickname || null,
-      });
+      const encrypted = await encryptVehicleInput(
+        {
+          year: form.year ? Number(form.year) : null,
+          make: form.make || null,
+          model: form.model || null,
+          nickname: form.nickname || null,
+        },
+        dataKey!,
+      );
+      await api.post("/vehicles", encrypted);
       setForm({ year: "", make: "", model: "", nickname: "" });
       setOpen(false);
       await load();

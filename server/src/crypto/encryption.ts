@@ -43,9 +43,11 @@ export function unwrapDataKey(wrapped: string): Buffer {
 }
 
 /**
- * Per-account field encryption. Instantiate with a user's unwrapped data key
- * (derived once per request from the authenticated session) and use to
- * encrypt/decrypt sensitive fields before persisting/reading them.
+ * Encrypts/decrypts a single value with an unwrapped key. The only remaining
+ * server-side use is the TOTP secret (see totpKeyWrapped on User): an auth
+ * credential the server must be able to verify pre-session, not user data.
+ * All vehicle/maintenance/fuel field encryption now happens client-side with
+ * a key the server never has - see client/src/crypto/vault.ts.
  */
 export class AccountCipher {
   constructor(private readonly dataKey: Buffer) {}
@@ -77,29 +79,15 @@ export class AccountCipher {
   }
 }
 
-// ---- Passphrase-based encryption for account export/import files ----
-
-const EXPORT_SCRYPT_N = 16384;
-const EXPORT_SALT_LENGTH = 16;
-
-function deriveExportKey(passphrase: string, salt: Buffer): Buffer {
-  return crypto.scryptSync(passphrase, salt, 32, { N: EXPORT_SCRYPT_N, r: 8, p: 1 });
-}
-
-/** Encrypts an arbitrary JSON-serializable export payload with a user-chosen passphrase. */
-export function encryptExportPayload(payload: unknown, passphrase: string): string {
-  const salt = crypto.randomBytes(EXPORT_SALT_LENGTH);
-  const key = deriveExportKey(passphrase, salt);
-  const body = encryptWithKey(JSON.stringify(payload), key);
-  const envelope = { v: 1, salt: salt.toString("base64"), body };
-  return JSON.stringify(envelope);
-}
-
-export function decryptExportPayload<T = unknown>(file: string, passphrase: string): T {
-  const envelope = JSON.parse(file) as { v: number; salt: string; body: string };
-  if (envelope.v !== 1) throw new Error("Unsupported export file version");
-  const salt = Buffer.from(envelope.salt, "base64");
-  const key = deriveExportKey(passphrase, salt);
-  const json = decryptWithKey(envelope.body, key);
-  return JSON.parse(json) as T;
+/**
+ * Constant-time equality check for the recovery-verifier proof submitted during
+ * account recovery. Both inputs are base64-encoded HKDF outputs (see
+ * client/src/crypto/vault.ts deriveRecoveryVerifier) - never the recovery key
+ * or anything that could be used to derive the vault-unwrap key.
+ */
+export function safeCompareB64(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "base64");
+  const bufB = Buffer.from(b, "base64");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }

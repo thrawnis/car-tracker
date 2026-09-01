@@ -2,6 +2,9 @@ import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { setAccessToken } from "@/api/client";
 import { useAuth } from "@/api/auth";
+import { useVault } from "@/api/vault";
+import { deriveKeyFromPassword, unwrapKey } from "@/crypto/vault";
+import { takePendingPassword } from "@/crypto/pending";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
@@ -10,6 +13,7 @@ export function TotpVerifyPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const { refreshUser } = useAuth();
+  const { setDataKey } = useVault();
   const mfaToken = (location.state as { mfaToken?: string } | null)?.mfaToken;
 
   const [code, setCode] = useState("");
@@ -33,11 +37,27 @@ export function TotpVerifyPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(useBackupCode ? { mfaToken, backupCode: code } : { mfaToken, code }),
       });
-      const data = (await httpRes.json()) as { accessToken?: string; error?: string };
-      if (!httpRes.ok || !data.accessToken) {
+      const data = (await httpRes.json()) as {
+        accessToken?: string;
+        vaultSalt?: string;
+        vaultKeyWrappedByPassword?: string;
+        error?: string;
+      };
+      if (!httpRes.ok || !data.accessToken || !data.vaultSalt || !data.vaultKeyWrappedByPassword) {
         setError(data.error ?? "Invalid code");
         return;
       }
+
+      const password = takePendingPassword();
+      if (password) {
+        // The vault key never touches the server or the network - it's derived
+        // here from the password we've been holding since the login step, plus
+        // the (safe-to-transmit) opaque salt and wrapped key from this response.
+        const wrappingKey = await deriveKeyFromPassword(password, data.vaultSalt);
+        const dataKey = await unwrapKey(data.vaultKeyWrappedByPassword, wrappingKey);
+        setDataKey(dataKey);
+      }
+
       setAccessToken(data.accessToken);
       await refreshUser();
       navigate("/", { replace: true });
