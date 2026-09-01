@@ -3,6 +3,7 @@ import { useAuth } from "@/api/auth";
 import { useVault } from "@/api/vault";
 import { api } from "@/api/client";
 import { exportBackup, unlockBackupFile, reencryptForImport } from "@/crypto/backup";
+import { generateSaltB64, deriveKeyFromPassword, wrapKey } from "@/crypto/vault";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
@@ -18,9 +19,106 @@ export function SettingsPage() {
       </div>
 
       <ReminderPrefsCard user={user} onSaved={refreshUser} />
+      <ChangePasswordCard />
       <ExportCard />
       <ImportCard />
     </div>
+  );
+}
+
+function ChangePasswordCard() {
+  const { dataKey } = useVault();
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(false);
+    if (newPassword !== confirmPassword) {
+      setError("New passwords do not match");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      // Re-wrap the SAME data key (already unlocked in this session) with a
+      // freshly salted key derived from the new password. The data key
+      // itself never changes, so nothing needs to be re-encrypted.
+      const newVaultSalt = generateSaltB64();
+      const newVaultKeyWrappedByPassword = await wrapKey(dataKey!, await deriveKeyFromPassword(newPassword, newVaultSalt));
+
+      await api.post("/auth/change-password", {
+        currentPassword,
+        newPassword,
+        newVaultSalt,
+        newVaultKeyWrappedByPassword,
+      });
+
+      setSuccess(true);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not change password");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Change password</CardTitle>
+        <CardDescription>
+          Changes your login password. Your recovery key stays the same and still works. Other signed-in devices
+          will be logged out.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={onSubmit} className="flex flex-col gap-4 sm:max-w-sm">
+          <div>
+            <Label htmlFor="currentPassword">Current password</Label>
+            <Input
+              id="currentPassword"
+              type="password"
+              required
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <Label htmlFor="newPassword">New password</Label>
+            <Input
+              id="newPassword"
+              type="password"
+              required
+              minLength={12}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <Label htmlFor="confirmNewPassword">Confirm new password</Label>
+            <Input
+              id="confirmNewPassword"
+              type="password"
+              required
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+            />
+          </div>
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          {success && <p className="text-sm text-emerald-600">Password changed.</p>}
+          <Button type="submit" disabled={submitting} className="self-start">
+            {submitting ? "Saving…" : "Change password"}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
   );
 }
 

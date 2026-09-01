@@ -17,15 +17,27 @@ import {
   rotateSession,
   revokeSession,
   revokeAllSessions,
+  revokeAllSessionsExcept,
   signAccessToken,
   signPurposeToken,
   verifyPurposeToken,
 } from "../auth/tokens.js";
+import {
+  generateVerificationCode,
+  hashVerificationCode,
+  EMAIL_VERIFICATION_TTL_MINUTES,
+} from "../auth/emailVerification.js";
 import { generateDataKey, wrapDataKey, unwrapDataKey, AccountCipher, safeCompareB64 } from "../crypto/encryption.js";
 import { env } from "../env.js";
 import { requireAuth } from "../middleware/auth.js";
+import { sendMail } from "../services/mailer.js";
 
 export const authRouter = Router();
+
+// Integration tests exercise far more request volume, from one "IP", than any
+// real client would - all rate limiters in this file skip in the test
+// environment, but stay on in dev/production.
+const skipInTest = () => env.NODE_ENV === "test";
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -33,6 +45,7 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => `${req.ip}:${(req.body as { email?: string })?.email ?? ""}`,
+  skip: skipInTest,
 });
 
 const REFRESH_COOKIE = "car_tracker_refresh";
@@ -61,8 +74,14 @@ async function getOrCreateTotpKey(userId: string, existingWrapped: string | null
 }
 
 const opaqueB64 = z.string().min(1).max(2000);
+const usernameSchema = z
+  .string()
+  .min(3, "Username must be at least 3 characters")
+  .max(30, "Username must be at most 30 characters")
+  .regex(/^[a-zA-Z0-9_.-]+$/, "Username may only contain letters, numbers, underscores, dots, and dashes");
 
 const registerSchema = z.object({
+  username: usernameSchema,
   email: z.string().email(),
   password: z.string().min(12, "Password must be at least 12 characters"),
   // All vault fields are generated and wrapped client-side; the server only ever
@@ -73,37 +92,151 @@ const registerSchema = z.object({
   recoveryVerifier: opaqueB64,
 });
 
+async function sendVerificationEmail(to: string, code: string): Promise<void> {
+  await sendMail({
+    to,
+    subject: "Verify your Car Tracker email",
+    text: `Your verification code is ${code}. It expires in ${EMAIL_VERIFICATION_TTL_MINUTES} minutes.`,
+    html: `<p>Your verification code is <strong>${code}</strong>. It expires in ${EMAIL_VERIFICATION_TTL_MINUTES} minutes.</p>`,
+  });
+}
+
 authRouter.post("/register", async (req, res) => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
     return;
   }
-  const { email, password, vaultSalt, vaultKeyWrappedByPassword, vaultKeyWrappedByRecovery, recoveryVerifier } =
+  const { username, email, password, vaultSalt, vaultKeyWrappedByPassword, vaultKeyWrappedByRecovery, recoveryVerifier } =
     parsed.data;
 
-  const existing = await prisma.user.findUnique({ where: { email } });
-  if (existing) {
+  const [existingEmail, existingUsername] = await Promise.all([
+    prisma.user.findUnique({ where: { email } }),
+    prisma.user.findUnique({ where: { username } }),
+  ]);
+  if (existingEmail) {
     res.status(409).json({ error: "An account with that email already exists" });
+    return;
+  }
+  if (existingUsername) {
+    res.status(409).json({ error: "That username is already taken" });
     return;
   }
 
   const passwordHash = await hashPassword(password);
+  const verification = generateVerificationCode();
 
   const user = await prisma.user.create({
     data: {
+      username,
       email,
       passwordHash,
       vaultSalt,
       vaultKeyWrappedByPassword,
       vaultKeyWrappedByRecovery,
       recoveryVerifier,
+      emailVerificationCodeHash: verification.hash,
+      emailVerificationExpiresAt: verification.expiresAt,
     },
   });
 
-  // 2FA is mandatory: the account cannot be used until TOTP enrollment finishes.
+  await sendVerificationEmail(email, verification.code);
+
+  // Email verification, then 2FA, are both mandatory before the account can be
+  // used - the same enroll token carries the client through both steps.
   const enrollToken = signPurposeToken(user.id, "enroll");
-  res.status(201).json({ enrollToken });
+  res.status(201).json({
+    enrollToken,
+    // Only ever included in the test environment, so integration tests can
+    // exercise verification without needing a real mailbox. NODE_ENV=test is
+    // set exclusively by server/test/setup.ts - never in dev or production.
+    ...(env.NODE_ENV === "test" ? { emailVerificationCode: verification.code } : {}),
+  });
+});
+
+authRouter.post("/verify-email", async (req, res) => {
+  const parsed = z.object({ enrollToken: z.string(), code: z.string().length(6) }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "enrollToken and a 6-digit code are required" });
+    return;
+  }
+
+  let userId: string;
+  try {
+    userId = verifyPurposeToken(parsed.data.enrollToken, "enroll");
+  } catch {
+    res.status(401).json({ error: "Invalid or expired enrollment token" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    res.status(404).end();
+    return;
+  }
+  if (user.emailVerified) {
+    res.status(400).json({ error: "Email already verified" });
+    return;
+  }
+  if (
+    !user.emailVerificationCodeHash ||
+    !user.emailVerificationExpiresAt ||
+    user.emailVerificationExpiresAt < new Date() ||
+    hashVerificationCode(parsed.data.code) !== user.emailVerificationCodeHash
+  ) {
+    res.status(400).json({ error: "Invalid or expired code" });
+    return;
+  }
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { emailVerified: true, emailVerificationCodeHash: null, emailVerificationExpiresAt: null },
+  });
+
+  res.status(204).end();
+});
+
+const resendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: skipInTest,
+});
+
+authRouter.post("/verify-email/resend", resendLimiter, async (req, res) => {
+  const parsed = z.object({ enrollToken: z.string() }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "enrollToken is required" });
+    return;
+  }
+
+  let userId: string;
+  try {
+    userId = verifyPurposeToken(parsed.data.enrollToken, "enroll");
+  } catch {
+    res.status(401).json({ error: "Invalid or expired enrollment token" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    res.status(404).end();
+    return;
+  }
+  if (user.emailVerified) {
+    res.status(400).json({ error: "Email already verified" });
+    return;
+  }
+
+  const verification = generateVerificationCode();
+  await prisma.user.update({
+    where: { id: userId },
+    data: { emailVerificationCodeHash: verification.hash, emailVerificationExpiresAt: verification.expiresAt },
+  });
+  await sendVerificationEmail(user.email, verification.code);
+
+  res.status(204).end();
 });
 
 authRouter.post("/totp/setup", async (req, res) => {
@@ -124,6 +257,10 @@ authRouter.post("/totp/setup", async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user || user.totpEnabled) {
     res.status(400).json({ error: "TOTP already enabled or account not found" });
+    return;
+  }
+  if (!user.emailVerified) {
+    res.status(403).json({ error: "Verify your email before setting up 2FA" });
     return;
   }
 
@@ -162,6 +299,10 @@ authRouter.post("/totp/enable", async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user || !user.totpSecretEncrypted || !user.totpKeyWrapped) {
     res.status(400).json({ error: "Run /totp/setup first" });
+    return;
+  }
+  if (!user.emailVerified) {
+    res.status(403).json({ error: "Verify your email before setting up 2FA" });
     return;
   }
 
@@ -213,9 +354,21 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
     return;
   }
 
+  // Both branches below also return the (safe, opaque) vaultFields so a client
+  // resuming an interrupted enrollment - possibly in a fresh tab/session that
+  // never held the data key generated at registration - can re-derive it from
+  // the password just entered, rather than being stuck without it.
+  if (!user.emailVerified) {
+    const enrollToken = signPurposeToken(user.id, "enroll");
+    res
+      .status(403)
+      .json({ error: "Email verification required", enrollToken, needsEmailVerification: true, ...vaultFields(user) });
+    return;
+  }
+
   if (!user.totpEnabled) {
     const enrollToken = signPurposeToken(user.id, "enroll");
-    res.status(403).json({ error: "2FA setup required", enrollToken });
+    res.status(403).json({ error: "2FA setup required", enrollToken, ...vaultFields(user) });
     return;
   }
 
@@ -326,6 +479,7 @@ authRouter.get("/me", requireAuth, async (req, res) => {
   }
   res.json({
     id: user.id,
+    username: user.username,
     email: user.email,
     timezone: user.timezone,
     reminderEmail: user.reminderEmail,
@@ -350,11 +504,57 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
   const user = await prisma.user.update({ where: { id: req.userId! }, data: parsed.data });
   res.json({
     id: user.id,
+    username: user.username,
     email: user.email,
     timezone: user.timezone,
     reminderEmail: user.reminderEmail,
     reminderLeadDays: user.reminderLeadDays,
   });
+});
+
+// ---- Change password (logged-in session) ----
+//
+// Unlike account recovery, this never touches the recovery key at all: the
+// client already holds the unwrapped data key (the vault is unlocked in a
+// logged-in session), so it just re-wraps that same key with a freshly
+// salted, new-password-derived key and sends the result here. The server's
+// only job is to verify the current password and swap in the new wrapping.
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string(),
+  newPassword: z.string().min(12, "Password must be at least 12 characters"),
+  newVaultSalt: opaqueB64,
+  newVaultKeyWrappedByPassword: opaqueB64,
+});
+
+authRouter.post("/change-password", requireAuth, async (req, res) => {
+  const parsed = changePasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: req.userId! } });
+  if (!user || !(await verifyPassword(user.passwordHash, parsed.data.currentPassword))) {
+    res.status(401).json({ error: "Incorrect current password" });
+    return;
+  }
+
+  const passwordHash = await hashPassword(parsed.data.newPassword);
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      passwordHash,
+      vaultSalt: parsed.data.newVaultSalt,
+      vaultKeyWrappedByPassword: parsed.data.newVaultKeyWrappedByPassword,
+    },
+  });
+
+  // Log out other devices/sessions, since they were authorized under the old
+  // password; keep this session (the one that just proved both passwords).
+  if (req.sessionId) await revokeAllSessionsExcept(user.id, req.sessionId);
+
+  res.status(204).end();
 });
 
 // ---- Account recovery (forgot password) ----
@@ -370,6 +570,7 @@ const recoveryLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => `${req.ip}:${(req.body as { email?: string })?.email ?? ""}`,
+  skip: skipInTest,
 });
 
 authRouter.post("/recovery/start", recoveryLimiter, async (req, res) => {

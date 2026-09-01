@@ -3,7 +3,8 @@ import { useNavigate, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
-import { setPendingPassword } from "@/crypto/pending";
+import { setPendingPassword, setPendingDataKey } from "@/crypto/pending";
+import { deriveKeyFromPassword, unwrapKey } from "@/crypto/vault";
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -23,10 +24,32 @@ export function LoginPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
       });
-      const data = (await httpRes.json()) as { mfaToken?: string; enrollToken?: string; error?: string };
+      const data = (await httpRes.json()) as {
+        mfaToken?: string;
+        enrollToken?: string;
+        needsEmailVerification?: boolean;
+        vaultSalt?: string;
+        vaultKeyWrappedByPassword?: string;
+        error?: string;
+      };
 
       if (data.enrollToken) {
-        navigate("/totp-setup", { state: { enrollToken: data.enrollToken } });
+        // Resuming an interrupted enrollment - possibly in a browser session
+        // that never held the data key generated at registration - so
+        // re-derive it here from the password just entered.
+        if (data.vaultSalt && data.vaultKeyWrappedByPassword) {
+          try {
+            const wrappingKey = await deriveKeyFromPassword(password, data.vaultSalt);
+            const dataKey = await unwrapKey(data.vaultKeyWrappedByPassword, wrappingKey);
+            setPendingDataKey(dataKey);
+          } catch {
+            // Wrapped fields came back malformed/corrupted; let the next step
+            // (verify-email or TOTP setup) surface the failure naturally.
+          }
+        }
+        navigate(data.needsEmailVerification ? "/verify-email" : "/totp-setup", {
+          state: { enrollToken: data.enrollToken, email },
+        });
         return;
       }
       if (!httpRes.ok || !data.mfaToken) {

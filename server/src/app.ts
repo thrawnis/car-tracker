@@ -27,7 +27,15 @@ export function createApp(): express.Express {
   app.use(cookieParser());
   if (env.NODE_ENV !== "test") app.use(pinoHttp());
 
-  const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+  const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // Integration tests exercise far more request volume, from one "IP", than
+    // any real client would - rate limiting stays on in dev/production.
+    skip: () => env.NODE_ENV === "test",
+  });
   app.use("/api", apiLimiter);
 
   app.get("/api/health", (_req, res) => res.json({ status: "ok" }));

@@ -8,8 +8,9 @@ interval, a mileage interval, whichever comes first, or a one-time date.
 
 - **Backend**: Node.js + TypeScript, Express, PostgreSQL via Prisma
 - **Frontend**: React + Vite + Tailwind CSS, React Router, Web Crypto API
-- **Auth**: email + password, with mandatory TOTP two-factor authentication
-  on every account (no accounts without 2FA)
+- **Auth**: username + email + password, with mandatory email verification
+  and mandatory TOTP two-factor authentication on every account (no accounts
+  without either)
 - **Encryption**: zero-knowledge, client-side. Sensitive fields (VIN, license
   plate, notes, vendor, cost) are encrypted and decrypted in the browser with
   a key the server never has — see Security model below.
@@ -69,15 +70,19 @@ key.
   for your password again; this is expected, not a bug, and requires no
   network round trip to resolve (the salt and wrapped key needed are already
   in hand from your session).
-- **Changing your password isn't supported yet.** The recovery-key flow
-  (Settings → "Forgot password?" from the login page) is currently the only
-  way to rotate your password, and it revokes all of your sessions when it
-  succeeds. A dedicated in-session "change password" flow is a natural
-  follow-up, not yet built.
+- **Changing your password from Settings** re-wraps the *same* data key with
+  a freshly salted key derived from the new password — nothing about your
+  vehicle data is re-encrypted, since the data key itself never changes.
+  It logs out every other signed-in device, but keeps the current one signed
+  in, and leaves your recovery key untouched (it still works afterward). The
+  "Forgot password?" flow on the login page is the alternative when you
+  don't know your *current* password: it uses the recovery key instead, and
+  also revokes every session, including the current one, since the request
+  can't yet be proven to come from you.
 
 ### What's deliberately *not* zero-knowledge
 
-Two things are exceptions, both auth mechanics rather than your data:
+A few things are exceptions, all auth mechanics rather than your data:
 
 - **The TOTP secret.** Verifying a 2FA code has to happen server-side,
   before you've done anything that could hand the server a decryption key —
@@ -86,11 +91,33 @@ Two things are exceptions, both auth mechanics rather than your data:
   same as a conventional app. Losing `MASTER_ENCRYPTION_KEY` breaks
   everyone's 2FA (they'd need to re-enroll) but does **not** expose any
   vehicle data — the two encryption systems don't share key material.
+- **Your username and email address** are plaintext, needed for login,
+  sign-in identification, and delivering reminder/verification emails.
 - **Non-sensitive fields** (year, make, model, ownership status, dates,
   odometer readings, fuel quantity/cost, reminder rule names/intervals) are
   stored in plaintext, same as before. They're needed for filtering/sorting
   and aren't considered sensitive. Only the fields listed above under "The
   vault key" are encrypted.
+
+### Registration and email verification
+
+Creating an account requires a username, email, and password up front (the
+data key, its wrappings, and the recovery key are all generated client-side
+during this same step — see above). Before the account can do anything else,
+two more steps are mandatory, in order:
+
+1. **Email verification** — a 6-digit code is emailed to the address you
+   registered with (expires after 15 minutes; a resend option is available,
+   rate-limited to 5 per 15 minutes). The server refuses to start TOTP setup,
+   and refuses to log in, for an unverified account.
+2. **TOTP 2FA enrollment** — as described above.
+
+If you close the tab partway through either step, signing back in with your
+username/email and password picks up exactly where you left off: the login
+response carries the same opaque vault-unwrap fields used at registration,
+so the client can re-derive the data key from the password you just typed
+without ever needing the value that was sitting in the original tab's
+memory.
 
 ### Sessions
 
@@ -144,8 +171,11 @@ npm install
 npm run dev              # http://localhost:5173, proxies /api to :4000
 ```
 
-Register an account, scan the QR code with an authenticator app (Google
-Authenticator, 1Password, Authy, etc.) to finish 2FA setup, then sign in.
+Register an account (username, email, password). With `MAIL_PROVIDER=none`,
+the verification code is logged to the server's console instead of emailed —
+copy it from there. Then scan the QR code with an authenticator app (Google
+Authenticator, 1Password, Authy, etc.) to finish 2FA setup, save your
+recovery key, and sign in.
 
 ## Production deployment (Docker Compose)
 
@@ -277,12 +307,19 @@ npm test
   "encrypt vehicle data" unit test to write — that logic doesn't exist here
   by design; see the client suite below.
 - Integration tests live in `test/integration/*.test.ts` and drive the real
-  Express app (`src/app.ts`) through Supertest: full register → 2FA enroll →
-  login → verify → refresh → logout, the account-recovery flow end to end,
-  cross-account ownership isolation on every resource, fuel-economy
-  calculation, the reminder sweep end-to-end, and a full export → wipe →
-  import round trip (including simulating a restore into a *different*
-  account, which requires client-side re-encryption).
+  Express app (`src/app.ts`) through Supertest: full register → verify email
+  → 2FA enroll → login → verify → refresh → logout, the account-recovery
+  flow end to end, changing your password from a logged-in session
+  (including that it keeps the current session alive while revoking others,
+  and leaves the recovery key working), username/email uniqueness, expired
+  and reused verification codes, cross-account ownership isolation on every
+  resource, fuel-economy calculation, the reminder sweep end-to-end, and a
+  full export → wipe → import round trip (including simulating a restore
+  into a *different* account, which requires client-side re-encryption).
+  Registration in tests gets the verification code back directly in the
+  `/register` response's `emailVerificationCode` field — but **only** when
+  `NODE_ENV=test` (set exclusively by `test/setup.ts`), so this never
+  activates outside the test run.
 - **`test/helpers.ts` imports `client/src/crypto/vault.ts` directly** rather
   than reimplementing its own copy of the crypto. Server integration tests
   therefore act as a real "browser stand-in": they generate and wrap data
@@ -321,13 +358,15 @@ server/            Express + Prisma API - stores only opaque ciphertext for
   prisma/schema.prisma
   src/
     app.ts          Express app factory (used by both index.ts and tests)
-    auth/           password hashing, TOTP, JWT/session helpers
+    auth/           password hashing, TOTP, JWT/session helpers,
+                     emailVerification.ts (6-digit code generation/hashing)
     crypto/         master-key envelope for the TOTP secret ONLY - not
                      used for vehicle/maintenance/fuel data
     middleware/      auth middleware
     routes/          REST endpoints (vehicles/maintenance/fuel/backup are
-                     opaque-blob pass-through; auth handles the vault-wrap
-                     fields and account recovery)
+                     opaque-blob pass-through; auth.ts handles registration,
+                     email verification, TOTP, login, change-password, and
+                     account recovery)
     services/        reminder evaluation, cron scheduler, mailer
     **/*.test.ts     unit tests, next to the code they test
   test/
@@ -345,8 +384,10 @@ client/            React + Vite + Tailwind frontend
     api/             fetch client, auth + vault contexts, crypto-mapping.ts
                      (encrypt/decrypt helpers per entity), types
     components/ui/    small shadcn-style UI primitives
-    pages/           route-level pages (RecoveryKeyPage, UnlockPage,
-                     ForgotPasswordPage are new for the zero-knowledge flow)
+    pages/           route-level pages: RecoveryKeyPage, UnlockPage,
+                     VerifyEmailPage, ForgotPasswordPage handle the
+                     zero-knowledge/verification flows; ChangePasswordCard
+                     lives inside SettingsPage
     **/*.test.ts(x)  unit/component tests, next to the code they test
     test/setup.ts     testing-library setup
   vitest.config.ts

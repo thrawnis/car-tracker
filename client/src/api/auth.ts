@@ -3,6 +3,7 @@ import { api, setAccessToken, apiFetch } from "./client";
 
 export interface Me {
   id: string;
+  username: string;
   email: string;
   timezone: string;
   reminderEmail: string | null;

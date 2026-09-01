@@ -6,6 +6,7 @@ import { UnlockPage } from "@/pages/UnlockPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
 import { RecoveryKeyPage } from "@/pages/RecoveryKeyPage";
+import { VerifyEmailPage } from "@/pages/VerifyEmailPage";
 import { TotpSetupPage } from "@/pages/TotpSetupPage";
 import { TotpVerifyPage } from "@/pages/TotpVerifyPage";
 import { ForgotPasswordPage } from "@/pages/ForgotPasswordPage";
@@ -43,6 +44,7 @@ export default function App() {
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
+            <Route path="/verify-email" element={<VerifyEmailPage />} />
             <Route path="/recovery-key" element={<RecoveryKeyPage />} />
             <Route path="/totp-setup" element={<TotpSetupPage />} />
             <Route path="/totp-verify" element={<TotpVerifyPage />} />

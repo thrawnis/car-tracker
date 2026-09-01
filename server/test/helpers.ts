@@ -20,6 +20,7 @@ import {
 // or plaintext for any encrypted field.
 
 export interface TestAccount {
+  username: string;
   email: string;
   password: string;
   accessToken: string;
@@ -35,9 +36,15 @@ export function uniqueEmail(): string {
   return `user${Date.now()}${counter}@example.com`;
 }
 
-/** Registers a brand-new account, completes mandatory TOTP enrollment, and returns a logged-in session. */
+export function uniqueUsername(): string {
+  counter += 1;
+  return `user${Date.now()}${counter}`;
+}
+
+/** Registers a brand-new account, verifies its email, completes mandatory TOTP enrollment, and returns a logged-in session. */
 export async function createAccount(app: Express, password = "supersecretpassword123"): Promise<TestAccount> {
   const email = uniqueEmail();
+  const username = uniqueUsername();
 
   const dataKey = await generateDataKey();
   const vaultSalt = generateSaltB64();
@@ -49,9 +56,22 @@ export async function createAccount(app: Express, password = "supersecretpasswor
 
   const registerRes = await request(app)
     .post("/api/auth/register")
-    .send({ email, password, vaultSalt, vaultKeyWrappedByPassword, vaultKeyWrappedByRecovery, recoveryVerifier })
+    .send({
+      username,
+      email,
+      password,
+      vaultSalt,
+      vaultKeyWrappedByPassword,
+      vaultKeyWrappedByRecovery,
+      recoveryVerifier,
+    })
     .expect(201);
   const enrollToken = registerRes.body.enrollToken as string;
+  // Only present because NODE_ENV=test (see routes/auth.ts) - stands in for
+  // "read the code out of the email" without needing a real mailbox.
+  const emailVerificationCode = registerRes.body.emailVerificationCode as string;
+
+  await request(app).post("/api/auth/verify-email").send({ enrollToken, code: emailVerificationCode }).expect(204);
 
   const setupRes = await request(app).post("/api/auth/totp/setup").send({ enrollToken }).expect(200);
   const secret = setupRes.body.secret as string;
@@ -62,6 +82,7 @@ export async function createAccount(app: Express, password = "supersecretpasswor
   const refreshCookie = extractRefreshCookie(enableRes.headers["set-cookie"]);
 
   return {
+    username,
     email,
     password,
     accessToken: enableRes.body.accessToken as string,

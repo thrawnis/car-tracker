@@ -25,10 +25,17 @@ export interface PurposeTokenPayload {
   purpose: PurposeTokenPurpose;
 }
 
-/** Short-lived, narrowly-scoped tokens for the register->2FA-enroll and login->2FA-verify handshakes. */
+// The "enroll" token spans email verification + recovery-key display + TOTP
+// setup, so it gets more time than a plain login MFA challenge.
+const PURPOSE_TOKEN_TTL: Record<PurposeTokenPurpose, jwt.SignOptions["expiresIn"]> = {
+  enroll: "30m",
+  mfa: "10m",
+};
+
+/** Short-lived, narrowly-scoped tokens for the register->verify->2FA-enroll and login->2FA-verify handshakes. */
 export function signPurposeToken(userId: string, purpose: PurposeTokenPurpose): string {
   return jwt.sign({ sub: userId, purpose } satisfies PurposeTokenPayload, env.JWT_ACCESS_SECRET, {
-    expiresIn: "10m",
+    expiresIn: PURPOSE_TOKEN_TTL[purpose],
   });
 }
 
@@ -89,4 +96,12 @@ export async function revokeSession(sessionId: string): Promise<void> {
 
 export async function revokeAllSessions(userId: string): Promise<void> {
   await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+}
+
+/** Revokes every other active session for this user - used after a password change to log out other devices. */
+export async function revokeAllSessionsExcept(userId: string, keepSessionId: string): Promise<void> {
+  await prisma.session.updateMany({
+    where: { userId, revokedAt: null, id: { not: keepSessionId } },
+    data: { revokedAt: new Date() },
+  });
 }

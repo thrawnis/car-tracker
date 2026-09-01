@@ -4,7 +4,7 @@ import request from "supertest";
 import { authenticator } from "otplib";
 import { createApp } from "../../src/app.js";
 import { resetDb } from "../resetDb.js";
-import { createAccount, authedRequest, uniqueEmail } from "../helpers.js";
+import { createAccount, authedRequest, uniqueEmail, uniqueUsername } from "../helpers.js";
 import { prisma } from "../../src/lib/db.js";
 import {
   generateDataKey,
@@ -39,43 +39,58 @@ async function registerVaultFields(password: string) {
   return { dataKey, recovery, vaultSalt, vaultKeyWrappedByPassword, vaultKeyWrappedByRecovery, recoveryVerifier };
 }
 
+/** Registers a new account manually (bypassing createAccount) and returns its enrollToken + verification code. */
+async function registerManually(password: string, overrides: { email?: string; username?: string } = {}) {
+  const fields = await registerVaultFields(password);
+  const username = overrides.username ?? uniqueUsername();
+  const email = overrides.email ?? uniqueEmail();
+  const res = await request(app)
+    .post("/api/auth/register")
+    .send({ username, email, password, ...fields });
+  return { res, fields, username, email };
+}
+
 describe("registration and mandatory 2FA enrollment", () => {
   it("rejects a weak password", async () => {
-    const fields = await registerVaultFields("short");
-    const res = await request(app)
-      .post("/api/auth/register")
-      .send({ email: uniqueEmail(), password: "short", ...fields });
+    const { res } = await registerManually("short");
     expect(res.status).toBe(400);
   });
 
   it("rejects registration missing vault fields (a real client always computes these)", async () => {
     const res = await request(app)
       .post("/api/auth/register")
-      .send({ email: uniqueEmail(), password: "supersecretpassword123" });
+      .send({ username: uniqueUsername(), email: uniqueEmail(), password: "supersecretpassword123" });
     expect(res.status).toBe(400);
+  });
+
+  it("rejects a username that's too short or has invalid characters", async () => {
+    const shortRes = await registerManually("supersecretpassword123", { username: "ab" });
+    expect(shortRes.res.status).toBe(400);
+
+    const invalidRes = await registerManually("supersecretpassword123", { username: "has a space" });
+    expect(invalidRes.res.status).toBe(400);
   });
 
   it("rejects duplicate registration for the same email", async () => {
     const email = uniqueEmail();
     const password = "supersecretpassword123";
-    await request(app)
-      .post("/api/auth/register")
-      .send({ email, password, ...(await registerVaultFields(password)) })
-      .expect(201);
-    const res = await request(app)
-      .post("/api/auth/register")
-      .send({ email, password: "anotherlongpassword123", ...(await registerVaultFields(password)) });
+    await registerManually(password, { email }).then(({ res }) => expect(res.status).toBe(201));
+    const { res } = await registerManually("anotherlongpassword123", { email });
+    expect(res.status).toBe(409);
+  });
+
+  it("rejects duplicate registration for the same username", async () => {
+    const username = uniqueUsername();
+    const password = "supersecretpassword123";
+    await registerManually(password, { username }).then(({ res }) => expect(res.status).toBe(201));
+    const { res } = await registerManually("anotherlongpassword123", { username });
     expect(res.status).toBe(409);
   });
 
   it("stores only opaque vault blobs for a new account - never anything resembling the password", async () => {
     const password = "supersecretpassword123";
-    const fields = await registerVaultFields(password);
-    const email = uniqueEmail();
-    await request(app)
-      .post("/api/auth/register")
-      .send({ email, password, ...fields })
-      .expect(201);
+    const { res, fields, email } = await registerManually(password);
+    expect(res.status).toBe(201);
 
     const row = await prisma.user.findUniqueOrThrow({ where: { email } });
     expect(row.vaultSalt).toBe(fields.vaultSalt);
@@ -86,15 +101,22 @@ describe("registration and mandatory 2FA enrollment", () => {
     }
   });
 
-  it("cannot enable 2FA with an incorrect code", async () => {
-    const email = uniqueEmail();
+  it("cannot enable 2FA before verifying email", async () => {
     const password = "supersecretpassword123";
-    const registerRes = await request(app)
-      .post("/api/auth/register")
-      .send({ email, password, ...(await registerVaultFields(password)) })
-      .expect(201);
+    const { res: registerRes } = await registerManually(password);
     const enrollToken = registerRes.body.enrollToken as string;
 
+    const res = await request(app).post("/api/auth/totp/setup").send({ enrollToken });
+    expect(res.status).toBe(403);
+  });
+
+  it("cannot enable 2FA with an incorrect code", async () => {
+    const password = "supersecretpassword123";
+    const { res: registerRes } = await registerManually(password);
+    const enrollToken = registerRes.body.enrollToken as string;
+    const code = registerRes.body.emailVerificationCode as string;
+
+    await request(app).post("/api/auth/verify-email").send({ enrollToken, code }).expect(204);
     await request(app).post("/api/auth/totp/setup").send({ enrollToken }).expect(200);
     const res = await request(app).post("/api/auth/totp/enable").send({ enrollToken, code: "000000" });
     expect(res.status).toBe(400);
@@ -106,16 +128,27 @@ describe("registration and mandatory 2FA enrollment", () => {
     expect(account.backupCodes).toHaveLength(10);
   });
 
-  it("blocks login until 2FA enrollment is completed", async () => {
-    const email = uniqueEmail();
+  it("blocks login until email is verified, before even checking 2FA", async () => {
     const password = "supersecretpassword123";
-    await request(app)
-      .post("/api/auth/register")
-      .send({ email, password, ...(await registerVaultFields(password)) })
-      .expect(201);
+    const { email } = await registerManually(password);
 
     const res = await request(app).post("/api/auth/login").send({ email, password });
     expect(res.status).toBe(403);
+    expect(res.body.needsEmailVerification).toBe(true);
+    expect(res.body.enrollToken).toBeTruthy();
+  });
+
+  it("blocks login until 2FA enrollment is completed, once email is verified", async () => {
+    const password = "supersecretpassword123";
+    const { res: registerRes, email } = await registerManually(password);
+    await request(app)
+      .post("/api/auth/verify-email")
+      .send({ enrollToken: registerRes.body.enrollToken, code: registerRes.body.emailVerificationCode })
+      .expect(204);
+
+    const res = await request(app).post("/api/auth/login").send({ email, password });
+    expect(res.status).toBe(403);
+    expect(res.body.needsEmailVerification).toBeUndefined();
     expect(res.body.enrollToken).toBeTruthy();
   });
 });
@@ -379,13 +412,14 @@ describe("account recovery (forgot password)", () => {
 // server's own verification, independent of the createAccount() helper.
 describe("totp codes generated directly with otplib", () => {
   it("are accepted by the verify endpoint", async () => {
-    const email = uniqueEmail();
     const password = "supersecretpassword123";
-    const registerRes = await request(app)
-      .post("/api/auth/register")
-      .send({ email, password, ...(await registerVaultFields(password)) })
-      .expect(201);
+    const { res: registerRes, email } = await registerManually(password);
+    expect(registerRes.status).toBe(201);
     const enrollToken = registerRes.body.enrollToken as string;
+    await request(app)
+      .post("/api/auth/verify-email")
+      .send({ enrollToken, code: registerRes.body.emailVerificationCode })
+      .expect(204);
     const setupRes = await request(app).post("/api/auth/totp/setup").send({ enrollToken }).expect(200);
     const secret = setupRes.body.secret as string;
 
@@ -399,5 +433,174 @@ describe("totp codes generated directly with otplib", () => {
       .post("/api/auth/totp/verify")
       .send({ mfaToken: loginRes.body.mfaToken, code: authenticator.generate(secret) });
     expect(verifyRes.status).toBe(200);
+  });
+});
+
+describe("email verification", () => {
+  it("rejects an incorrect code", async () => {
+    const { res: registerRes } = await registerManually("supersecretpassword123");
+    const res = await request(app)
+      .post("/api/auth/verify-email")
+      .send({ enrollToken: registerRes.body.enrollToken, code: "000000" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects an expired code", async () => {
+    const { res: registerRes, email } = await registerManually("supersecretpassword123");
+    await prisma.user.update({
+      where: { email },
+      data: { emailVerificationExpiresAt: new Date(Date.now() - 60 * 1000) },
+    });
+
+    const res = await request(app)
+      .post("/api/auth/verify-email")
+      .send({ enrollToken: registerRes.body.enrollToken, code: registerRes.body.emailVerificationCode });
+    expect(res.status).toBe(400);
+  });
+
+  it("accepts the correct code and rejects reusing it once already verified", async () => {
+    const { res: registerRes } = await registerManually("supersecretpassword123");
+    const enrollToken = registerRes.body.enrollToken as string;
+    const code = registerRes.body.emailVerificationCode as string;
+
+    await request(app).post("/api/auth/verify-email").send({ enrollToken, code }).expect(204);
+
+    const res = await request(app).post("/api/auth/verify-email").send({ enrollToken, code });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/already verified/i);
+  });
+
+  it("resend issues a new working code, invalidating the old one", async () => {
+    const { res: registerRes } = await registerManually("supersecretpassword123");
+    const enrollToken = registerRes.body.enrollToken as string;
+    const oldCode = registerRes.body.emailVerificationCode as string;
+
+    await request(app).post("/api/auth/verify-email/resend").send({ enrollToken }).expect(204);
+
+    // The old code no longer matches the freshly generated one.
+    const oldCodeRes = await request(app).post("/api/auth/verify-email").send({ enrollToken, code: oldCode });
+    expect(oldCodeRes.status).toBe(400);
+  });
+
+  it("blocks TOTP setup until the email is verified", async () => {
+    const { res: registerRes } = await registerManually("supersecretpassword123");
+    const enrollToken = registerRes.body.enrollToken as string;
+
+    const blocked = await request(app).post("/api/auth/totp/setup").send({ enrollToken });
+    expect(blocked.status).toBe(403);
+
+    await request(app)
+      .post("/api/auth/verify-email")
+      .send({ enrollToken, code: registerRes.body.emailVerificationCode })
+      .expect(204);
+
+    const allowed = await request(app).post("/api/auth/totp/setup").send({ enrollToken });
+    expect(allowed.status).toBe(200);
+  });
+});
+
+describe("change password (logged-in session)", () => {
+  it("rejects an incorrect current password", async () => {
+    const account = await createAccount(app);
+    const authed = authedRequest(app, account);
+
+    const res = await authed.post("/api/auth/change-password").send({
+      currentPassword: "wrong-password",
+      newPassword: "brand-new-password-123",
+      newVaultSalt: generateSaltB64(),
+      newVaultKeyWrappedByPassword: "irrelevant",
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("changes the password so the new one logs in and unwraps the same data key", async () => {
+    const account = await createAccount(app);
+    const authed = authedRequest(app, account);
+
+    const newPassword = "brand-new-password-123";
+    const newVaultSalt = generateSaltB64();
+    const newVaultKeyWrappedByPassword = await wrapKey(
+      account.dataKey,
+      await deriveKeyFromPassword(newPassword, newVaultSalt),
+    );
+
+    await authed
+      .post("/api/auth/change-password")
+      .send({ currentPassword: account.password, newPassword, newVaultSalt, newVaultKeyWrappedByPassword })
+      .expect(204);
+
+    // Old password no longer works.
+    await request(app).post("/api/auth/login").send({ email: account.email, password: account.password }).expect(401);
+
+    // New password does, and unwraps the same data key as before.
+    const loginRes = await request(app)
+      .post("/api/auth/login")
+      .send({ email: account.email, password: newPassword })
+      .expect(200);
+    const verifyRes = await request(app)
+      .post("/api/auth/totp/verify")
+      .send({ mfaToken: loginRes.body.mfaToken, backupCode: account.backupCodes[0] })
+      .expect(200);
+
+    const wrappingKey = await deriveKeyFromPassword(newPassword, verifyRes.body.vaultSalt);
+    const dataKeyAfterChange = await unwrapKey(verifyRes.body.vaultKeyWrappedByPassword, wrappingKey);
+    expect(await keysAreEqual(dataKeyAfterChange, account.dataKey)).toBe(true);
+  });
+
+  it("does not touch the recovery key - it still unwraps the same data key after a password change", async () => {
+    const account = await createAccount(app);
+    const authed = authedRequest(app, account);
+
+    const newPassword = "brand-new-password-123";
+    const newVaultSalt = generateSaltB64();
+    const newVaultKeyWrappedByPassword = await wrapKey(
+      account.dataKey,
+      await deriveKeyFromPassword(newPassword, newVaultSalt),
+    );
+    await authed
+      .post("/api/auth/change-password")
+      .send({ currentPassword: account.password, newPassword, newVaultSalt, newVaultKeyWrappedByPassword })
+      .expect(204);
+
+    const startRes = await request(app).post("/api/auth/recovery/start").send({ email: account.email }).expect(200);
+    const raw = (await import("../../../client/src/crypto/vault.js")).parseRecoveryKey(account.recoveryKeyDisplay);
+    const unwrapKeyMaterial = await deriveRecoveryUnwrapKey(raw);
+    const recoveredDataKey = await unwrapKey(startRes.body.vaultKeyWrappedByRecovery, unwrapKeyMaterial);
+    expect(await keysAreEqual(recoveredDataKey, account.dataKey)).toBe(true);
+  });
+
+  it("revokes other sessions but keeps the current one alive", async () => {
+    const account = await createAccount(app);
+    const authed = authedRequest(app, account);
+
+    // A second "device" session for the same account.
+    const otherLogin = await request(app)
+      .post("/api/auth/login")
+      .send({ email: account.email, password: account.password })
+      .expect(200);
+    const otherVerify = await request(app)
+      .post("/api/auth/totp/verify")
+      .send({ mfaToken: otherLogin.body.mfaToken, backupCode: account.backupCodes[0] })
+      .expect(200);
+    const otherRefreshCookie = otherVerify.headers["set-cookie"]
+      .find((c: string) => c.startsWith("car_tracker_refresh="))!
+      .split(";")[0]!;
+
+    const newPassword = "brand-new-password-123";
+    const newVaultSalt = generateSaltB64();
+    const newVaultKeyWrappedByPassword = await wrapKey(
+      account.dataKey,
+      await deriveKeyFromPassword(newPassword, newVaultSalt),
+    );
+    await authed
+      .post("/api/auth/change-password")
+      .send({ currentPassword: account.password, newPassword, newVaultSalt, newVaultKeyWrappedByPassword })
+      .expect(204);
+
+    // The "current" session (the one that made the change-password call) still works...
+    await authed.get("/api/auth/me").expect(200);
+    // ...but the other device's session was revoked.
+    const otherRefreshRes = await request(app).post("/api/auth/refresh").set("Cookie", otherRefreshCookie);
+    expect(otherRefreshRes.status).toBe(401);
   });
 });

@@ -16,6 +16,7 @@ import { setPendingDataKey } from "@/crypto/pending";
 
 export function RegisterPage() {
   const navigate = useNavigate();
+  const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -50,6 +51,7 @@ export function RegisterPage() {
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          username,
           email,
           password,
           vaultSalt,
@@ -65,9 +67,12 @@ export function RegisterPage() {
         return;
       }
 
-      // Held in memory only until the recovery-key and TOTP-setup steps finish.
+      // Held in memory only until the verify-email, recovery-key, and
+      // TOTP-setup steps finish.
       setPendingDataKey(dataKey);
-      navigate("/recovery-key", { state: { enrollToken: data.enrollToken, recoveryKeyDisplay: recovery.display } });
+      navigate("/verify-email", {
+        state: { enrollToken: data.enrollToken, email, recoveryKeyDisplay: recovery.display },
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
@@ -82,12 +87,26 @@ export function RegisterPage() {
           <CardTitle>Create your account</CardTitle>
           <CardDescription>
             Your data is encrypted in your browser before it's ever sent — we can't read it, even if we wanted
-            to. Two-factor authentication (TOTP) is required on every account, and you'll get a one-time recovery
-            key next: without your password OR that key, no one (including us) can decrypt your data.
+            to. You'll need to confirm your email with a code we send you, then set up two-factor authentication
+            (TOTP) and save a one-time recovery key: without your password OR that key, no one (including us) can
+            decrypt your data.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="flex flex-col gap-4">
+            <div>
+              <Label htmlFor="username">Username</Label>
+              <Input
+                id="username"
+                required
+                minLength={3}
+                maxLength={30}
+                pattern="[a-zA-Z0-9_.\-]+"
+                title="Letters, numbers, underscores, dots, and dashes only"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+            </div>
             <div>
               <Label htmlFor="email">Email</Label>
               <Input id="email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />

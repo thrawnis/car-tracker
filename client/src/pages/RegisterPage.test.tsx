@@ -23,6 +23,7 @@ describe("RegisterPage", () => {
     const user = userEvent.setup();
     renderPage();
 
+    await user.type(screen.getByLabelText(/^username$/i), "newuser");
     await user.type(screen.getByLabelText(/^email$/i), "new@example.com");
     await user.type(screen.getByLabelText(/^password$/i), "supersecretpassword123");
     await user.type(screen.getByLabelText(/confirm password/i), "different-password");
@@ -42,6 +43,7 @@ describe("RegisterPage", () => {
     const user = userEvent.setup();
     renderPage();
 
+    await user.type(screen.getByLabelText(/^username$/i), "newuser");
     await user.type(screen.getByLabelText(/^email$/i), "new@example.com");
     await user.type(screen.getByLabelText(/^password$/i), "supersecretpassword123");
     await user.type(screen.getByLabelText(/confirm password/i), "supersecretpassword123");
@@ -53,6 +55,7 @@ describe("RegisterPage", () => {
 
     const [, options] = fetchMock.mock.calls[0]!;
     const body = JSON.parse(options.body as string);
+    expect(body.username).toBe("newuser");
     expect(body.email).toBe("new@example.com");
     expect(body.password).toBe("supersecretpassword123");
     // The vault fields must be present and must NOT be (or contain) the plaintext

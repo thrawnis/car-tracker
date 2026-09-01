@@ -37,9 +37,16 @@ enum FuelUnit {
 
 model User {
   id                    String   @id @default(uuid())
+  username              String   @unique
   email                 String   @unique
   passwordHash          String
-  emailVerified         Boolean  @default(false)
+
+  // Email verification: a 6-digit code, hashed the same way TOTP backup
+  // codes are, is emailed at registration. The account can't log in or
+  // finish 2FA setup until it's confirmed.
+  emailVerified               Boolean   @default(false)
+  emailVerificationCodeHash   String?
+  emailVerificationExpiresAt  DateTime?
 
   // TOTP 2FA - mandatory for all accounts. The TOTP secret is an auth
   // credential the server must be able to verify pre-session, so it uses its
@@ -80,6 +87,7 @@ model User {
   loginAttempts         LoginAttempt[]
 
   @@index([email])
+  @@index([username])
 }
 
 model Session {
