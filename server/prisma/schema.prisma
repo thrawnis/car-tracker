@@ -1,0 +1,230 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OwnershipStatus {
+  OWNED
+  SOLD
+  TOTALED
+  TRADED_IN
+  GIFTED
+}
+
+enum ReminderTriggerType {
+  DATE_INTERVAL
+  MILEAGE_INTERVAL
+  DATE_OR_MILEAGE
+  ONE_TIME_DATE
+}
+
+enum ReminderStatus {
+  PENDING
+  DUE
+  SENT
+  DISMISSED
+  COMPLETED
+}
+
+enum FuelUnit {
+  GALLONS
+  LITERS
+}
+
+model User {
+  id                    String   @id @default(uuid())
+  email                 String   @unique
+  passwordHash          String
+  emailVerified         Boolean  @default(false)
+
+  // TOTP 2FA - mandatory for all accounts
+  totpSecretEncrypted   String?
+  totpEnabled           Boolean  @default(false)
+  totpBackupCodesHashed String[] @default([])
+
+  // Per-account encryption: a random data key is generated at signup,
+  // wrapped (encrypted) with the server master key. All sensitive
+  // fields for this user's data are encrypted with the unwrapped data key.
+  wrappedDataKey        String
+
+  timezone              String   @default("UTC")
+  reminderEmail         String?
+  reminderLeadDays      Int      @default(7)
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  vehicles              Vehicle[]
+  sessions              Session[]
+  loginAttempts         LoginAttempt[]
+
+  @@index([email])
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String @unique
+  userAgent    String?
+  ipAddress    String?
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+
+  @@index([userId])
+}
+
+model LoginAttempt {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email     String
+  success   Boolean
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+}
+
+model Vehicle {
+  id               String          @id @default(uuid())
+  userId           String
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Non-sensitive, used for sorting/filtering
+  year             Int?
+  make             String?
+  model            String?
+  trim             String?
+
+  // Encrypted (per-account key) - sensitive identifiers
+  vinEncrypted           String?
+  licensePlateEncrypted  String?
+  nicknameEncrypted      String?
+  notesEncrypted         String?
+
+  ownershipStatus  OwnershipStatus @default(OWNED)
+  acquiredDate     DateTime?
+  disposedDate     DateTime?
+
+  fuelUnit         FuelUnit        @default(GALLONS)
+
+  photoUrl         String?
+
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  maintenanceRecords MaintenanceRecord[]
+  fuelLogs           FuelLog[]
+  odometerReadings   OdometerReading[]
+  reminderRules      ReminderRule[]
+
+  @@index([userId])
+}
+
+model OdometerReading {
+  id         String   @id @default(uuid())
+  vehicleId  String
+  vehicle    Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  odometer   Int
+  readAt     DateTime @default(now())
+  source     String   @default("manual") // manual | fuel_log | maintenance
+
+  createdAt  DateTime @default(now())
+
+  @@index([vehicleId, readAt])
+}
+
+model MaintenanceRecord {
+  id               String   @id @default(uuid())
+  vehicleId        String
+  vehicle          Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  serviceType      String   // e.g. "Oil Change", free text or from a preset list
+  performedAt      DateTime
+  odometer         Int?
+
+  // Encrypted sensitive/free-text fields
+  notesEncrypted        String?
+  vendorEncrypted       String?
+  costCentsEncrypted    String?  // stored as encrypted string of an integer (cents)
+
+  reminderRuleId   String?
+  reminderRule     ReminderRule? @relation(fields: [reminderRuleId], references: [id], onDelete: SetNull)
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([vehicleId, performedAt])
+}
+
+model FuelLog {
+  id                String   @id @default(uuid())
+  vehicleId         String
+  vehicle           Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  filledAt          DateTime
+  odometer          Int
+  quantity          Float    // gallons or liters, per vehicle.fuelUnit
+  pricePerUnitCents Int?
+  totalCostCents    Int?
+  missedFillUp      Boolean  @default(false) // partial tank / not-to-full, affects MPG calc
+  isFull            Boolean  @default(true)
+
+  notesEncrypted    String?
+
+  createdAt         DateTime @default(now())
+
+  @@index([vehicleId, filledAt])
+}
+
+model ReminderRule {
+  id              String              @id @default(uuid())
+  vehicleId       String
+  vehicle         Vehicle             @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  name            String              // e.g. "Oil Change"
+  triggerType     ReminderTriggerType
+
+  intervalDays    Int?                // for DATE_INTERVAL / DATE_OR_MILEAGE
+  intervalMiles   Int?                // for MILEAGE_INTERVAL / DATE_OR_MILEAGE
+  oneTimeDate     DateTime?           // for ONE_TIME_DATE
+
+  lastCompletedAt      DateTime?
+  lastCompletedOdometer Int?
+
+  leadDays        Int                 @default(7) // notify this many days before due
+  leadMiles       Int                 @default(300) // notify this many miles before due
+
+  active          Boolean             @default(true)
+
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  maintenanceRecords MaintenanceRecord[]
+  reminders          Reminder[]
+
+  @@index([vehicleId])
+}
+
+model Reminder {
+  id             String         @id @default(uuid())
+  reminderRuleId String
+  reminderRule   ReminderRule   @relation(fields: [reminderRuleId], references: [id], onDelete: Cascade)
+
+  status         ReminderStatus @default(PENDING)
+  dueDate        DateTime?
+  dueOdometer    Int?
+
+  notifiedAt     DateTime?
+
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([reminderRuleId, status])
+}
