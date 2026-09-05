@@ -214,7 +214,9 @@ docker compose up -d --build
 
 This starts three containers:
 
-- `db` — PostgreSQL 16, data persisted in the `car_tracker_db` volume.
+- `db` — PostgreSQL 16, data persisted to `./data/postgres` on the host (so
+  everything the app stores lives under the repo's `data/` folder — back it
+  up or move it by copying that one directory).
 - `server` — the API. On startup it runs `prisma db push` to sync the
   database schema, then starts the Express server, including the daily
   reminder-check cron job.

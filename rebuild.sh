@@ -30,6 +30,11 @@ git -C "$REPO" reset --hard
 echo "==> Pulling latest code..."
 git -C "$REPO" pull origin "$BRANCH"
 
+# Ensure host-side data dir exists before Docker bind-mounts it (all persisted
+# data lives under $REPO/data so a backup/restore is just that one folder).
+echo "==> Creating data directories..."
+mkdir -p "$REPO/data/postgres"
+
 COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 # Build both images directly with buildx so BuildKit is guaranteed. Compose's
