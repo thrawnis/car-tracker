@@ -16,6 +16,7 @@ services:
 
   server:
     build: ./server
+    image: car-tracker-server:latest
     restart: unless-stopped
     depends_on:
       db:
@@ -41,6 +42,7 @@ services:
 
   client:
     build: ./client
+    image: car-tracker-client:latest
     restart: unless-stopped
     depends_on:
       - server
