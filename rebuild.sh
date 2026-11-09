@@ -30,19 +30,29 @@ git -C "$REPO" checkout "$BRANCH"
 echo "==> Discarding any local changes..."
 git -C "$REPO" reset --hard
 
-BEFORE_COMMIT=$(git -C "$REPO" rev-parse HEAD)
-
 echo "==> Pulling latest code..."
 git -C "$REPO" pull origin "$BRANCH"
 
-AFTER_COMMIT=$(git -C "$REPO" rev-parse HEAD)
+HEAD_COMMIT=$(git -C "$REPO" rev-parse HEAD)
 
-# Skip the (slow) build + restart if nothing changed and the stack is already
-# up - re-running this unattended (e.g. from cron) shouldn't bounce containers
-# for no reason. --force, or no containers currently running, always proceeds.
-if [ "$FORCE" -eq 0 ] && [ "$BEFORE_COMMIT" = "$AFTER_COMMIT" ] \
-   && [ -n "$(docker compose -f "$COMPOSE_FILE" ps -q 2>/dev/null)" ]; then
-  echo "==> No new commits and containers are already running - nothing to do."
+# running_commit <service>: the car-tracker.commit label baked into the image
+# a running container for that service was built from, or empty if the
+# service isn't running (or was built before this label existed).
+running_commit() {
+  local cid
+  cid=$(docker compose -f "$COMPOSE_FILE" ps -q "$1" 2>/dev/null)
+  [ -n "$cid" ] || return 0
+  docker inspect --format '{{ index .Config.Labels "car-tracker.commit" }}' "$cid" 2>/dev/null || true
+}
+
+# Skip the (slow) build + restart only if what's actually running already
+# matches HEAD - not just "the pull brought no new commits", which misses a
+# container restarted from a stale image, an interrupted previous run, etc.
+# --force always proceeds.
+if [ "$FORCE" -eq 0 ] \
+   && [ "$(running_commit server)" = "$HEAD_COMMIT" ] \
+   && [ "$(running_commit client)" = "$HEAD_COMMIT" ]; then
+  echo "==> Running containers already match HEAD ($HEAD_COMMIT) - nothing to do."
   echo "    (use --force to rebuild/restart anyway)"
   docker compose -f "$COMPOSE_FILE" ps
   exit 0
@@ -53,26 +63,26 @@ fi
 echo "==> Creating data directories..."
 mkdir -p "$REPO/data/postgres"
 
-COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-
 # Build both images directly with buildx so BuildKit is guaranteed. Compose's
 # buildx detection is unreliable on some hosts and can silently fall back to the
 # legacy (non-BuildKit) builder. --load makes each built image available to the
 # local Docker daemon so Compose can pick it up by the tag pinned in
 # docker-compose.yml (image: car-tracker-server:latest / car-tracker-client:latest).
+# The car-tracker.commit label is what running_commit() above reads on the
+# next run to tell whether a deployed container matches the current HEAD.
 #
 # NOTE: use --tag (long form), never -t — on some hosts -t has tripped a bogus
 # "unknown shorthand flag" error even though `docker buildx build` works fine.
-BUILD_ARGS=(--load)
+BUILD_ARGS=(--load --label "car-tracker.commit=$HEAD_COMMIT")
 if [ "$PULL_BASE_IMAGES" -eq 1 ]; then
   echo "    (--pull-base-images set: forcing a base-image registry check)"
   BUILD_ARGS+=(--pull)
 fi
 
-echo "==> Building $SERVER_IMAGE with buildx (commit: $COMMIT)..."
+echo "==> Building $SERVER_IMAGE with buildx (commit: $HEAD_COMMIT)..."
 docker buildx build --tag "$SERVER_IMAGE" "${BUILD_ARGS[@]}" "$REPO/server"
 
-echo "==> Building $CLIENT_IMAGE with buildx (commit: $COMMIT)..."
+echo "==> Building $CLIENT_IMAGE with buildx (commit: $HEAD_COMMIT)..."
 docker buildx build --tag "$CLIENT_IMAGE" "${BUILD_ARGS[@]}" "$REPO/client"
 
 echo "==> Restarting containers..."
