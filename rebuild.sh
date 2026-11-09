@@ -10,12 +10,15 @@ CLIENT_IMAGE="car-tracker-client:latest"
 # --pull-base-images: opt-in registry check for a newer base image (FROM ...).
 # Off by default — pulling the base on every rebuild is slow for basically no
 # benefit; run it manually now and then to pick up upstream base updates.
+# --force: rebuild and restart even if the pull brought no new commits.
 PULL_BASE_IMAGES=0
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --pull-base-images) PULL_BASE_IMAGES=1 ;;
+    --force) FORCE=1 ;;
     -h|--help)
-      echo "Usage: $(basename "$0") [--pull-base-images]"
+      echo "Usage: $(basename "$0") [--pull-base-images] [--force]"
       exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
@@ -27,8 +30,23 @@ git -C "$REPO" checkout "$BRANCH"
 echo "==> Discarding any local changes..."
 git -C "$REPO" reset --hard
 
+BEFORE_COMMIT=$(git -C "$REPO" rev-parse HEAD)
+
 echo "==> Pulling latest code..."
 git -C "$REPO" pull origin "$BRANCH"
+
+AFTER_COMMIT=$(git -C "$REPO" rev-parse HEAD)
+
+# Skip the (slow) build + restart if nothing changed and the stack is already
+# up - re-running this unattended (e.g. from cron) shouldn't bounce containers
+# for no reason. --force, or no containers currently running, always proceeds.
+if [ "$FORCE" -eq 0 ] && [ "$BEFORE_COMMIT" = "$AFTER_COMMIT" ] \
+   && [ -n "$(docker compose -f "$COMPOSE_FILE" ps -q 2>/dev/null)" ]; then
+  echo "==> No new commits and containers are already running - nothing to do."
+  echo "    (use --force to rebuild/restart anyway)"
+  docker compose -f "$COMPOSE_FILE" ps
+  exit 0
+fi
 
 # Ensure host-side data dir exists before Docker bind-mounts it (all persisted
 # data lives under $REPO/data so a backup/restore is just that one folder).
