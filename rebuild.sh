@@ -24,14 +24,19 @@ for arg in "$@"; do
   esac
 done
 
+echo "==> Fetching latest code..."
+git -C "$REPO" fetch origin "$BRANCH"
+
 echo "==> Switching to branch: $BRANCH"
 git -C "$REPO" checkout "$BRANCH"
 
+# Discard ALL local changes - tracked edits and untracked files alike - and
+# land exactly on origin's history, no matter what state the working copy or
+# local branch was in (diverged history, a failed merge, manual edits...).
+# git clean skips anything gitignored (.env, data/), so those are untouched.
 echo "==> Discarding any local changes..."
-git -C "$REPO" reset --hard
-
-echo "==> Pulling latest code..."
-git -C "$REPO" pull origin "$BRANCH"
+git -C "$REPO" reset --hard "origin/$BRANCH"
+git -C "$REPO" clean -fd
 
 HEAD_COMMIT=$(git -C "$REPO" rev-parse HEAD)
 
